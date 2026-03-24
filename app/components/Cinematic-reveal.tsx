@@ -1,62 +1,63 @@
 "use client";
-import { motion, AnimatePresence } from "motion/react";
-import { useState, useEffect } from "react";
+import { motion } from "framer-motion";
 
-export default function CinematicReveal() {
-    const [isVisible, setIsVisible] = useState(true);
+interface CinematicProps {
+    heading: string;
+}
 
-    useEffect(() => {
-        // Unmount after the animation finishes
-        const timer = setTimeout(() => {
-            setIsVisible(false);
-        }, 2500); 
-        
-        return () => clearTimeout(timer);
-    }, []);
-
+export default function CinematicReveal({ heading }: CinematicProps) {
     return (
-        <AnimatePresence>
-            {isVisible && (
-                <motion.div
-                    className="fixed z-[100] pointer-events-none rounded-full bg-transparent"
-                    style={{
-                        left: "5vw",
-                        bottom: "40%",
-                        // Centers the circle exactly on that coordinate
-                        transform: "translate(-50%, 50%)", 
-                        
-                        // THE FIX: Layered Box Shadows for a perfect gradient
-                        // 1. 'inset 0 0 60px black' -> Fades the inside edge of the circle
-                        // 2. '0 0 100px 40px black' -> Creates the soft blurry gradient outside the circle
-                        // 3. '0 0 0 150vmax black' -> The giant solid black wall that covers the screen
-                        boxShadow: `
-                            inset 0 0 60px black, 
-                            0 0 100px 40px black, 
-                            0 0 0 150vmax black
-                        `
-                    }}
+        // 'fixed inset-0' makes it global, covering the entire browser window.
+        // 'pointer-events-none' ensures you can play the game once the black fades.
+        <div className="fixed inset-0 z-100 pointer-events-none overflow-hidden flex items-center justify-center">
+
+            {/* 1. The Global Black Background */}
+            <motion.div
+                className="absolute inset-0 bg-black"
+                initial={{ opacity: 1 }}
+                animate={{ 
+                    opacity: [1, 1, 0] // 1. Solid black, 2. Hold solid black, 3. Fade to transparent
+                }}
+                transition={{
+                    duration: 4, // Total animation time
+                    // 0 to 0.4 (40% of time) = Hold. 0.4 to 1.0 = Fade out.
+                    times: [0, 0.4, 1], 
+                    ease: "easeInOut"
+                }}
+            />
+
+            {/* 2. The Single Moving Text */}
+            <motion.div
+                className="absolute text-white font-mono font-bold z-101 [-webkit-text-stroke:2px_black]"
+                initial={{
+                    top: "50%",
+                    left: "50%",
+                    x: "-50%",
+                    y: "-50%",
+                    scale: 1.5
+                }}
+                animate={{
+                    // Moves from Center (50%) to Top-Left (5%)
+                    top: ["50%", "50%", "5%"],   
+                    left: ["50%", "50%", "5%"],  
                     
-                    initial={{ 
-                        width: "100px", 
-                        height: "100px",
-                        opacity: 1
-                    }}
+                    // Removes the centering offset so it sits flush in the corner
+                    x: ["-50%", "-50%", "0%"],   
+                    y: ["-50%", "-50%", "0%"],
                     
-                    animate={{ 
-                        width: "300vmax", 
-                        height: "300vmax",
-                        opacity: 1
-                    }}
-                    
-                    transition={{ 
-                        duration: 1.5, 
-                        delay: 0, 
-                        ease: "easeInOut" 
-                    }}
-                    
-                    exit={{ opacity: 0, transition: { duration: 0.2 } }}
-                />
-            )}
-        </AnimatePresence>
+                    // Shrinks from 1.5x down to normal size
+                    scale: [1.5, 1.5, 1],        
+                }}
+                transition={{
+                    duration: 4, 
+                    times: [0, 0.4, 1], // Exactly synced with the background fade!
+                    ease: "easeInOut"
+                }}
+            >
+                {/* The tracking-wider class helps it look more cinematic */}
+                <h1 className="text-6xl md:text-8xl drop-shadow-md tracking-wider">{heading}</h1>
+            </motion.div>
+
+        </div>
     );
 }

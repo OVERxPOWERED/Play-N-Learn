@@ -3,6 +3,7 @@ import { useRef } from 'react';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
 
+
 gsap.registerPlugin(useGSAP);
 
 interface PlayerProps {
@@ -54,6 +55,8 @@ export default function Player({ xPos = 0, yPos = 0, isMovingL, isMovingR, isJum
                 backgroundPosition: 'bottom center',
                 backgroundRepeat: 'no-repeat',
             }}
-        />
+        >
+        </div>
     );
 }
+
