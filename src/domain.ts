@@ -2,7 +2,7 @@ export interface PlayerStats {
   totalGamesPlayed: number;
   totalScore: number;
   averageScore: number;
-  totalPlayTime: number; // in seconds
+  totalPlayTime: number;
   modulesCompleted: number;
   currentStreak: number;
   longestStreak: number;
@@ -25,7 +25,7 @@ export interface GameSession {
   moduleId: string;
   score: number;
   maxPossibleScore: number;
-  duration: number; // in seconds
+  duration: number;
   completedAt: Date;
   metadata?: Record<string, unknown>;
 }
@@ -39,8 +39,8 @@ export interface LearningModule {
   description: string;
   difficulty: ModuleDifficulty;
   category: ModuleCategory;
-  prerequisites: string[]; // module IDs
-  estimatedDuration: number; // in seconds
+  prerequisites: string[];
+  estimatedDuration: number;
   maxScore: number;
   contentVersion: string;
   isActive: boolean;
@@ -56,7 +56,7 @@ export interface ProgressTracking {
   completionStatus: CompletionStatus;
   bestScore: number;
   attempts: number;
-  totalPlayTime: number; // in seconds
+  totalPlayTime: number;
   lastAttemptAt: Date | null;
   completedAt: Date | null;
   masteredAt: Date | null;
@@ -121,32 +121,4 @@ export function isValidModuleCategory(value: string): value is ModuleCategory {
 
 export function isValidCompletionStatus(value: string): value is CompletionStatus {
   return COMPLETION_STATUSES.includes(value as CompletionStatus);
-}
-
-export function createDefaultPlayerStats(): PlayerStats {
-  return {
-    totalGamesPlayed: 0,
-    totalScore: 0,
-    averageScore: 0,
-    totalPlayTime: 0,
-    modulesCompleted: 0,
-    currentStreak: 0,
-    longestStreak: 0,
-    lastPlayedAt: null,
-  };
-}
-
-export function createDefaultProgressTracking(playerId: string, moduleId: string): ProgressTracking {
-  return {
-    playerId,
-    moduleId,
-    completionStatus: 'not_started',
-    bestScore: 0,
-    attempts: 0,
-    totalPlayTime: 0,
-    lastAttemptAt: null,
-    completedAt: null,
-    masteredAt: null,
-    attemptHistory: [],
-  };
 }
