@@ -1,5 +1,82 @@
 ```typescript
-// lib/services/playerService.ts
+// utils/playerService.ts
+
+export interface Player {
+  id: string;
+  username: string;
+  email: string;
+  displayName: string;
+  avatarUrl: string | null;
+  xp: number;
+  level: number;
+  totalGamesPlayed: number;
+  totalWins: number;
+  totalLosses: number;
+  totalDraws: number;
+  currentStreak: number;
+  bestStreak: number;
+  createdAt: Date;
+  updatedAt: Date;
+  lastActiveAt: Date;
+}
+
+export interface GameSessionInput {
+  playerId: string;
+  gameId: string;
+  result: 'win' | 'loss' | 'draw';
+  xpEarned: number;
+  durationMs: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface GameSession {
+  id: string;
+  playerId: string;
+  gameId: string;
+  result: 'win' | 'loss' | 'draw';
+  xpEarned: number;
+  durationMs: number;
+  metadata: Record<string, unknown> | null;
+  createdAt: Date;
+}
+
+export interface LearningProgress {
+  id: string;
+  playerId: string;
+  conceptId: string;
+  conceptName: string;
+  masteryLevel: number;
+  lastPracticedAt: Date;
+  totalAttempts: number;
+  correctAttempts: number;
+}
+
+export interface PlayerStats {
+  player: Player;
+  recentSessions: GameSession[];
+  winRate: number;
+  averageSessionDuration: number;
+  xpToNextLevel: number;
+  progressToNextLevel: number;
+}
+
+export interface LeaderboardEntry {
+  rank: number;
+  playerId: string;
+  username: string;
+  displayName: string;
+  avatarUrl: string | null;
+  level: number;
+  xp: number;
+  totalGamesPlayed: number;
+  winRate: number;
+}
+
+export interface LeaderboardResponse {
+  entries: LeaderboardEntry[];
+  totalPlayers: number;
+  playerRank?: number;
+}
 
 export class AppError extends Error {
   public readonly statusCode: number;
@@ -36,169 +113,76 @@ export class AppError extends Error {
   }
 }
 
-export interface PlayerInput {
-  username: string;
-  email: string;
-  displayName?: string;
-  avatarUrl?: string;
+export interface PlayerRepository {
+  findById(id: string): Promise<Player | null>;
+  findByEmail(email: string): Promise<Player | null>;
+  findByUsername(username: string): Promise<Player | null>;
+  create(player: Omit<Player, 'id' | 'createdAt' | 'updatedAt'>): Promise<Player>;
+  update(id: string, data: Partial<Player>): Promise<Player>;
+  delete(id: string): Promise<void>;
+  findAll(limit?: number, offset?: number): Promise<Player[]>;
+  count(): Promise<number>;
 }
 
-export interface Player {
-  id: string;
-  username: string;
-  email: string;
-  displayName: string;
-  avatarUrl: string | null;
-  xp: number;
-  level: number;
-  totalGamesPlayed: number;
-  totalWins: number;
-  totalLosses: number;
-  totalDraws: number;
-  currentStreak: number;
-  bestStreak: number;
-  createdAt: Date;
-  updatedAt: Date;
-  lastActiveAt: Date;
+export interface GameSessionRepository {
+  create(session: Omit<GameSession, 'id' | 'createdAt'>): Promise<GameSession>;
+  findByPlayerId(playerId: string, limit?: number, offset?: number): Promise<GameSession[]>;
+  findById(id: string): Promise<GameSession | null>;
+  countByPlayerId(playerId: string): Promise<number>;
 }
 
-export interface GameSessionData {
-  playerId: string;
-  gameId: string;
-  result: 'win' | 'loss' | 'draw';
-  xpEarned: number;
-  durationMs: number;
-  metadata?: Record<string, unknown>;
+export interface LearningProgressRepository {
+  findByPlayerId(playerId: string): Promise<LearningProgress[]>;
+  upsert(progress: Omit<LearningProgress, 'id'>): Promise<LearningProgress>;
+  findByPlayerIdAndConcept(playerId: string, conceptId: string): Promise<LearningProgress | null>;
 }
 
-export interface GameSession {
-  id: string;
-  playerId: string;
-  gameId: string;
-  result: 'win' | 'loss' | 'draw';
-  xpEarned: number;
-  durationMs: number;
-  metadata: Record<string, unknown> | null;
-  createdAt: Date;
-}
+class InMemoryPlayerRepository implements PlayerRepository {
+  private players = new Map<string, Player>();
+  private idCounter = 0;
 
-export interface PlayerStats {
-  player: Player;
-  recentSessions: GameSession[];
-  winRate: number;
-  averageSessionDuration: number;
-  xpToNextLevel: number;
-  progressToNextLevel: number;
-}
-
-export interface LeaderboardEntry {
-  rank: number;
-  playerId: string;
-  username: string;
-  displayName: string;
-  avatarUrl: string | null;
-  level: number;
-  xp: number;
-  totalGamesPlayed: number;
-  winRate: number;
-}
-
-export interface LeaderboardResponse {
-  entries: LeaderboardEntry[];
-  totalPlayers: number;
-  playerRank?: number;
-}
-
-interface ApiResponse<T> {
-  data: T | null;
-  error: string | null;
-}
-
-const XP_PER_LEVEL = 1000;
-const XP_LEVEL_MULTIPLIER = 1.5;
-
-function calculateLevelFromXp(xp: number): number {
-  if (xp < 0) return 1;
-  let level = 1;
-  let xpRequired = XP_PER_LEVEL;
-  let remainingXp = xp;
-
-  while (remainingXp >= xpRequired) {
-    remainingXp -= xpRequired;
-    level++;
-    xpRequired = Math.floor(xpRequired * XP_LEVEL_MULTIPLIER);
+  async findById(id: string): Promise<Player | null> {
+    return this.players.get(id) ?? null;
   }
 
-  return level;
-}
-
-function calculateXpForLevel(level: number): number {
-  if (level <= 1) return 0;
-  let totalXp = 0;
-  let xpRequired = XP_PER_LEVEL;
-
-  for (let i = 1; i < level; i++) {
-    totalXp += xpRequired;
-    xpRequired = Math.floor(xpRequired * XP_LEVEL_MULTIPLIER);
-  }
-
-  return totalXp;
-}
-
-function calculateXpToNextLevel(currentXp: number): number {
-  const currentLevel = calculateLevelFromXp(currentXp);
-  const xpForCurrentLevel = calculateXpForLevel(currentLevel);
-  const xpForNextLevel = calculateXpForLevel(currentLevel + 1);
-  return xpForNextLevel - currentXp;
-}
-
-function calculateProgressToNextLevel(currentXp: number): number {
-  const currentLevel = calculateLevelFromXp(currentXp);
-  const xpForCurrentLevel = calculateXpForLevel(currentLevel);
-  const xpForNextLevel = calculateXpForLevel(currentLevel + 1);
-  const progressXp = currentXp - xpForCurrentLevel;
-  const totalXpForLevel = xpForNextLevel - xpForCurrentLevel;
-  return Math.min(100, Math.max(0, (progressXp / totalXpForLevel) * 100));
-}
-
-function sanitizeString(input: string, maxLength: number = 100): string {
-  return input.trim().slice(0, maxLength);
-}
-
-function validateEmail(email: string): boolean {
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  return emailRegex.test(email);
-}
-
-function validateUsername(username: string): boolean {
-  const usernameRegex = /^[a-zA-Z0-9_-]{3,30}$/;
-  return usernameRegex.test(username);
-}
-
-function generateId(): string {
-  return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-}
-
-const mockPlayerDatabase = new Map<string, Player>();
-const mockSessionDatabase = new Map<string, GameSession[]>();
-
-async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promise<ApiResponse<T>> {
-  try {
-    const response = await fetch(endpoint, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        ...options.headers,
-      },
-    });
-
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({ message: 'Request failed' }));
-      return { data: null, error: errorData.message || `HTTP ${response.status}` };
+  async findByEmail(email: string): Promise<Player | null> {
+    for (const player of this.players.values()) {
+      if (player.email === email) return player;
     }
-
-    const data = await response.json();
-    return { data, error: null };
-  } catch (error) {
-    return { data: null, error: error instanceof Error ? error.message : 'Network error' };
+    return null;
   }
+
+  async findByUsername(username: string): Promise<Player | null> {
+    for (const player of this.players.values()) {
+      if (player.username === username) return player;
+    }
+    return null;
+  }
+
+  async create(playerData: Omit<Player, 'id' | 'createdAt' | 'updatedAt'>): Promise<Player> {
+    const id = `player_${++this.idCounter}_${Date.now()}`;
+    const now = new Date();
+    const player: Player = {
+      ...playerData,
+      id,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.players.set(id, player);
+    return player;
+  }
+
+  async update(id: string, data: Partial<Player>): Promise<Player> {
+    const player = this.players.get(id);
+    if (!player) throw AppError.notFound('Player');
+    const updated = { ...player, ...data, updatedAt: new Date() };
+    this.players.set(id, updated);
+    return updated;
+  }
+
+  async delete(id: string): Promise<void> {
+    this.players.delete(id);
+  }
+
+  async findAll(limit = 50, offset = 0): Promise<Player[]> {
+    const all = Array.from(this.play
