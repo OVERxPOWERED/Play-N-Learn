@@ -1,3 +1,6 @@
+```typescript
+import { z } from 'zod';
+
 export interface PlayerStats {
   totalGamesPlayed: number;
   totalScore: number;
@@ -13,6 +16,9 @@ export interface Player {
   id: string;
   username: string;
   email: string;
+  avatarUrl: string | null;
+  xp: number;
+  level: number;
   authProvider: 'email' | 'google' | 'github' | 'discord';
   createdAt: Date;
   updatedAt: Date;
@@ -22,12 +28,20 @@ export interface Player {
 export interface GameSession {
   id: string;
   playerId: string;
-  moduleId: string;
+  gameType: string;
   score: number;
-  maxPossibleScore: number;
   duration: number;
   completedAt: Date;
   metadata?: Record<string, unknown>;
+}
+
+export interface LearningProgress {
+  id: string;
+  playerId: string;
+  subject: string;
+  topic: string;
+  masteryLevel: number;
+  lastPracticed: Date;
 }
 
 export type ModuleDifficulty = 'beginner' | 'intermediate' | 'advanced' | 'expert';
@@ -122,3 +136,92 @@ export function isValidModuleCategory(value: string): value is ModuleCategory {
 export function isValidCompletionStatus(value: string): value is CompletionStatus {
   return COMPLETION_STATUSES.includes(value as CompletionStatus);
 }
+
+const dateSchema = z.union([
+  z.date(),
+  z.string().datetime().transform((val) => new Date(val)),
+  z.number().transform((val) => new Date(val)),
+]);
+
+const playerStatsSchema = z.object({
+  totalGamesPlayed: z.number().int().nonnegative(),
+  totalScore: z.number().nonnegative(),
+  averageScore: z.number().nonnegative(),
+  totalPlayTime: z.number().nonnegative(),
+  modulesCompleted: z.number().int().nonnegative(),
+  currentStreak: z.number().int().nonnegative(),
+  longestStreak: z.number().int().nonnegative(),
+  lastPlayedAt: dateSchema.nullable(),
+});
+
+export const playerSchema = z.object({
+  id: z.string().uuid(),
+  username: z.string().min(3).max(32).regex(/^[a-zA-Z0-9_-]+$/),
+  email: z.string().email(),
+  avatarUrl: z.string().url().nullable(),
+  xp: z.number().int().nonnegative(),
+  level: z.number().int().positive(),
+  authProvider: z.enum(['email', 'google', 'github', 'discord']),
+  createdAt: dateSchema,
+  updatedAt: dateSchema,
+  stats: playerStatsSchema,
+});
+
+export const gameSessionSchema = z.object({
+  id: z.string().uuid(),
+  playerId: z.string().uuid(),
+  gameType: z.string().min(1).max(64),
+  score: z.number().int().nonnegative(),
+  duration: z.number().int().positive(),
+  completedAt: dateSchema,
+  metadata: z.record(z.unknown()).optional(),
+});
+
+export const learningProgressSchema = z.object({
+  id: z.string().uuid(),
+  playerId: z.string().uuid(),
+  subject: z.string().min(1).max(64),
+  topic: z.string().min(1).max(128),
+  masteryLevel: z.number().min(0).max(1),
+  lastPracticed: dateSchema,
+});
+
+export const learningModuleSchema = z.object({
+  id: z.string().uuid(),
+  title: z.string().min(1).max(128),
+  description: z.string().min(1).max(1024),
+  difficulty: z.enum(MODULE_DIFFICULTIES),
+  category: z.enum(MODULE_CATEGORIES),
+  prerequisites: z.array(z.string().uuid()),
+  estimatedDuration: z.number().int().positive(),
+  maxScore: z.number().int().positive(),
+  contentVersion: z.string().min(1).max(32),
+  isActive: z.boolean(),
+  createdAt: dateSchema,
+  updatedAt: dateSchema,
+});
+
+export const attemptRecordSchema = z.object({
+  sessionId: z.string().uuid(),
+  score: z.number().int().nonnegative(),
+  duration: z.number().int().positive(),
+  completedAt: dateSchema,
+  metadata: z.record(z.unknown()).optional(),
+});
+
+export const progressTrackingSchema = z.object({
+  playerId: z.string().uuid(),
+  moduleId: z.string().uuid(),
+  completionStatus: z.enum(COMPLETION_STATUSES),
+  bestScore: z.number().int().nonnegative(),
+  attempts: z.number().int().nonnegative(),
+  totalPlayTime: z.number().nonnegative(),
+  lastAttemptAt: dateSchema.nullable(),
+  completedAt: dateSchema.nullable(),
+  masteredAt: dateSchema.nullable(),
+  attemptHistory: z.array(attemptRecordSchema),
+});
+
+export const gameSessionCreateInputSchema = z.object({
+  playerId: z.string().uuid(),
+  moduleId: z.string
