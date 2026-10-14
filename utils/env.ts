@@ -1,21 +1,13 @@
-import { type NextAuthConfig } from 'next-auth';
-
 /**
  * Environment variable schema definition
  * Defines all required environment variables with their validation rules
  */
 interface EnvSchema {
+  DATABASE_URL: string;
   NEXTAUTH_SECRET: string;
   NEXTAUTH_URL: string;
-  DATABASE_URL: string;
-  GOOGLE_CLIENT_ID: string;
-  GOOGLE_CLIENT_SECRET: string;
-  GITHUB_CLIENT_ID: string;
-  GITHUB_CLIENT_SECRET: string;
-  APPLE_CLIENT_ID: string;
-  APPLE_TEAM_ID: string;
-  APPLE_KEY_ID: string;
-  APPLE_PRIVATE_KEY: string;
+  API_RATE_LIMIT: string;
+  REDIS_URL?: string;
 }
 
 /**
@@ -108,19 +100,13 @@ function validateNonEmpty(value: string): string {
 }
 
 /**
- * Validates base64 or PEM format private key
+ * Validates positive integer string
  */
-function validatePrivateKey(value: string): string {
-  const trimmed = value.trim();
-  // Check for PEM format (-----BEGIN ... PRIVATE KEY-----)
-  const isPem = /^-----BEGIN [A-Z ]+PRIVATE KEY-----/m.test(trimmed);
-  // Check for base64 format (common for Apple private keys)
-  const isBase64 = /^[A-Za-z0-9+/]+={0,2}$/.test(trimmed.replace(/\s/g, ''));
-  
-  if (!isPem && !isBase64 && trimmed.length < 32) {
-    throw new Error('Invalid private key format');
+function validatePositiveInteger(value: string): string {
+  const num = parseInt(value.trim(), 10);
+  if (isNaN(num) || num <= 0) {
+    throw new Error('Must be a positive integer');
   }
-  
   return value;
 }
 
@@ -134,31 +120,32 @@ export function parseEnv(): EnvSchema {
     return validatedEnv;
   }
 
-  const missingVars: string[] = [];
-  const invalidVars: string[] = [];
-
   const requiredVars: Array<{
     key: keyof EnvSchema;
     validator?: (value: string) => string;
   }> = [
+    { key: 'DATABASE_URL', validator: validateNonEmpty },
     { key: 'NEXTAUTH_SECRET', validator: validateNonEmpty },
     { key: 'NEXTAUTH_URL', validator: validateUrl },
-    { key: 'DATABASE_URL', validator: validateNonEmpty },
-    { key: 'GOOGLE_CLIENT_ID', validator: validateNonEmpty },
-    { key: 'GOOGLE_CLIENT_SECRET', validator: validateNonEmpty },
-    { key: 'GITHUB_CLIENT_ID', validator: validateNonEmpty },
-    { key: 'GITHUB_CLIENT_SECRET', validator: validateNonEmpty },
-    { key: 'APPLE_CLIENT_ID', validator: validateNonEmpty },
-    { key: 'APPLE_TEAM_ID', validator: validateNonEmpty },
-    { key: 'APPLE_KEY_ID', validator: validateNonEmpty },
-    { key: 'APPLE_PRIVATE_KEY', validator: validatePrivateKey },
+    { key: 'API_RATE_LIMIT', validator: validatePositiveInteger },
   ];
 
-  const env: Partial<EnvSchema> = {};
+  const optionalVars: Array<{
+    key: keyof EnvSchema;
+    validator?: (value: string) => string;
+  }> = [
+    { key: 'REDIS_URL', validator: validateUrl },
+  ];
 
+  const missingVars: string[] = [];
+  const invalidVars: string[] = [];
+  const result: Partial<EnvSchema> = {};
+
+  // Validate required variables
   for (const { key, validator } of requiredVars) {
+    const value = process.env[key];
     try {
-      env[key] = validateEnvVar(key, process.env[key], validator);
+      result[key] = validateEnvVar(key, value, validator);
     } catch (error) {
       if (error instanceof EnvValidationError) {
         missingVars.push(...error.missingVars);
@@ -169,94 +156,64 @@ export function parseEnv(): EnvSchema {
     }
   }
 
+  // Validate optional variables
+  for (const { key, validator } of optionalVars) {
+    const value = process.env[key];
+    if (value !== undefined && value !== '') {
+      try {
+        result[key] = validateEnvVar(key, value, validator);
+      } catch (error) {
+        if (error instanceof EnvValidationError) {
+          invalidVars.push(...error.invalidVars);
+        } else {
+          invalidVars.push(key);
+        }
+      }
+    }
+  }
+
   if (missingVars.length > 0 || invalidVars.length > 0) {
     throw new EnvValidationError(missingVars, invalidVars);
   }
 
-  validatedEnv = env as EnvSchema;
+  validatedEnv = result as EnvSchema;
   return validatedEnv;
 }
 
 /**
- * Gets the validated environment configuration
- * Parses on first call, returns cached result on subsequent calls
- * @returns Validated environment configuration
+ * Gets a typed environment variable value
+ * @param key - The environment variable key
+ * @returns The validated environment variable value
+ * @throws EnvValidationError if the variable is not validated or missing
  */
-export function getEnv(): EnvSchema {
+export function getEnv<K extends keyof EnvSchema>(key: K): EnvSchema[K] {
+  const env = parseEnv();
+  const value = env[key];
+  
+  if (value === undefined) {
+    throw new EnvValidationError([key], []);
+  }
+  
+  return value;
+}
+
+/**
+ * Checks if all required environment variables are valid
+ * @returns True if all required variables are present and valid
+ */
+export function isEnvValid(): boolean {
+  try {
+    parseEnv();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Gets all validated environment variables
+ * @returns Complete validated environment configuration
+ */
+export function getAllEnv(): EnvSchema {
   return parseEnv();
 }
-
-/**
- * Checks if the application is running in production mode
- * @returns True if NODE_ENV is 'production'
- */
-export function isProduction(): boolean {
-  return process.env.NODE_ENV === 'production';
-}
-
-/**
- * Checks if the application is running in development mode
- * @returns True if NODE_ENV is 'development' or not set
- */
-export function isDevelopment(): boolean {
-  return process.env.NODE_ENV === 'development' || !process.env.NODE_ENV;
-}
-
-/**
- * Checks if the application is running in test mode
- * @returns True if NODE_ENV is 'test'
- */
-export function isTest(): boolean {
-  return process.env.NODE_ENV === 'test';
-}
-
-/**
- * Gets the NextAuth configuration options from environment
- * Useful for constructing NextAuth config dynamically
- * @returns NextAuth configuration object
- */
-export function getNextAuthConfig(): Partial<NextAuthConfig> {
-  const env = getEnv();
-  
-  return {
-    secret: env.NEXTAUTH_SECRET,
-    url: env.NEXTAUTH_URL,
-    // Additional NextAuth options can be added here
-  };
-}
-
-/**
- * Resets the cached environment configuration
- * Primarily useful for testing
- */
-export function resetEnvCache(): void {
-  validatedEnv = null;
-}
-
-/**
- * Type-safe access to individual environment variables
- * Throws if the variable hasn't been validated yet
- */
-export const env = {
-  get NEXTAUTH_SECRET(): string {
-    return getEnv().NEXTAUTH_SECRET;
-  },
-  get NEXTAUTH_URL(): string {
-    return getEnv().NEXTAUTH_URL;
-  },
-  get DATABASE_URL(): string {
-    return getEnv().DATABASE_URL;
-  },
-  get GOOGLE_CLIENT_ID(): string {
-    return getEnv().GOOGLE_CLIENT_ID;
-  },
-  get GOOGLE_CLIENT_SECRET(): string {
-    return getEnv().GOOGLE_CLIENT_SECRET;
-  },
-  get GITHUB_CLIENT_ID(): string {
-    return getEnv().GITHUB_CLIENT_ID;
-  },
-  get GITHUB_CLIENT_SECRET(): string {
-    return getEnv().GITHUB_CLIENT_SECRET;
-  },
-  get APPLE_CLIENT_ID():
