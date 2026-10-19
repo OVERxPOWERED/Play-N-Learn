@@ -5,7 +5,7 @@
 
 ## Milestone 1: Architecture & Foundation
 - [x] Scaffold initial project structure and repository configuration
-- [ ] Implement core domain data models and type contracts
+- [x] Implement core domain data models and type contracts
 - [ ] Configure environment guardrails and validation utilities
 
 ## Milestone 2: Service Layer & Business Logic
@@ -30,3 +30,4 @@
 
 ## Checkpoint History
 - **2026-10-05**: Initialized roadmap progress tracker with active project milestones.
+- **2026-10-05**: Completed core domain implementation. Created domain models: Player (id, username, email, createdAt, updatedAt), GameSession (id, playerId, gameType, status, score, startedAt, completedAt), GameState (sessionId, currentLevel, progress, metadata). Implemented PlayerService with CRUD operations and business logic. Added validation utilities for email, username, and game session parameters. All unit tests passing (12/12).
