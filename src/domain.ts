@@ -1,5 +1,28 @@
 ```typescript
-import { z } from 'zod';
+export enum PlayerRole {
+  PLAYER = 'player',
+  ADMIN = 'admin',
+  MODERATOR = 'moderator',
+  GUEST = 'guest',
+}
+
+export enum SessionStatus {
+  PENDING = 'pending',
+  ACTIVE = 'active',
+  PAUSED = 'paused',
+  COMPLETED = 'completed',
+  ABANDONED = 'abandoned',
+  EXPIRED = 'expired',
+}
+
+export enum GamePhase {
+  LOBBY = 'lobby',
+  LOADING = 'loading',
+  PLAYING = 'playing',
+  PAUSED = 'paused',
+  RESULTS = 'results',
+  FINISHED = 'finished',
+}
 
 export interface PlayerStats {
   totalGamesPlayed: number;
@@ -19,6 +42,7 @@ export interface Player {
   avatarUrl: string | null;
   xp: number;
   level: number;
+  role: PlayerRole;
   authProvider: 'email' | 'google' | 'github' | 'discord';
   createdAt: Date;
   updatedAt: Date;
@@ -31,8 +55,23 @@ export interface GameSession {
   gameType: string;
   score: number;
   duration: number;
-  completedAt: Date;
+  status: SessionStatus;
+  startedAt: Date;
+  completedAt: Date | null;
   metadata?: Record<string, unknown>;
+}
+
+export interface GameState {
+  sessionId: string;
+  phase: GamePhase;
+  currentScore: number;
+  maxPossibleScore: number;
+  timeRemaining: number;
+  level: number;
+  lives: number;
+  powerUps: string[];
+  customData: Record<string, unknown>;
+  updatedAt: Date;
 }
 
 export interface LearningProgress {
@@ -121,9 +160,41 @@ export interface ProgressUpdateInput {
   completed: boolean;
 }
 
-export const MODULE_DIFFICULTIES: ModuleDifficulty[] = ['beginner', 'intermediate', 'advanced', 'expert'];
-export const MODULE_CATEGORIES: ModuleCategory[] = ['math', 'science', 'language', 'logic', 'memory', 'creativity'];
-export const COMPLETION_STATUSES: CompletionStatus[] = ['not_started', 'in_progress', 'completed', 'mastered'];
+export interface GameStateUpdateInput {
+  sessionId: string;
+  phase?: GamePhase;
+  currentScore?: number;
+  timeRemaining?: number;
+  level?: number;
+  lives?: number;
+  powerUps?: string[];
+  customData?: Record<string, unknown>;
+}
+
+export interface PlayerCreateInput {
+  username: string;
+  email: string;
+  authProvider: 'email' | 'google' | 'github' | 'discord';
+  avatarUrl?: string | null;
+}
+
+export interface PlayerUpdateInput {
+  username?: string;
+  email?: string;
+  avatarUrl?: string | null;
+  xp?: number;
+  level?: number;
+  role?: PlayerRole;
+}
+
+const MODULE_DIFFICULTIES: ModuleDifficulty[] = ['beginner', 'intermediate', 'advanced', 'expert'];
+const MODULE_CATEGORIES: ModuleCategory[] = ['math', 'science', 'language', 'logic', 'memory', 'creativity'];
+const COMPLETION_STATUSES: CompletionStatus[] = ['not_started', 'in_progress', 'completed', 'mastered'];
+const PLAYER_ROLES: PlayerRole[] = [PlayerRole.PLAYER, PlayerRole.ADMIN, PlayerRole.MODERATOR, PlayerRole.GUEST];
+const SESSION_STATUSES: SessionStatus[] = [SessionStatus.PENDING, SessionStatus.ACTIVE, SessionStatus.PAUSED, SessionStatus.COMPLETED, SessionStatus.ABANDONED, SessionStatus.EXPIRED];
+const GAME_PHASES: GamePhase[] = [GamePhase.LOBBY, GamePhase.LOADING, GamePhase.PLAYING, GamePhase.PAUSED, GamePhase.RESULTS, GamePhase.FINISHED];
+const AUTH_PROVIDERS = ['email', 'google', 'github', 'discord'] as const;
+const LEADERBOARD_PERIODS = ['daily', 'weekly', 'monthly', 'all_time'] as const;
 
 export function isValidModuleDifficulty(value: string): value is ModuleDifficulty {
   return MODULE_DIFFICULTIES.includes(value as ModuleDifficulty);
@@ -137,91 +208,17 @@ export function isValidCompletionStatus(value: string): value is CompletionStatu
   return COMPLETION_STATUSES.includes(value as CompletionStatus);
 }
 
-const dateSchema = z.union([
-  z.date(),
-  z.string().datetime().transform((val) => new Date(val)),
-  z.number().transform((val) => new Date(val)),
-]);
+export function isValidPlayerRole(value: string): value is PlayerRole {
+  return PLAYER_ROLES.includes(value as PlayerRole);
+}
 
-const playerStatsSchema = z.object({
-  totalGamesPlayed: z.number().int().nonnegative(),
-  totalScore: z.number().nonnegative(),
-  averageScore: z.number().nonnegative(),
-  totalPlayTime: z.number().nonnegative(),
-  modulesCompleted: z.number().int().nonnegative(),
-  currentStreak: z.number().int().nonnegative(),
-  longestStreak: z.number().int().nonnegative(),
-  lastPlayedAt: dateSchema.nullable(),
-});
+export function isValidSessionStatus(value: string): value is SessionStatus {
+  return SESSION_STATUSES.includes(value as SessionStatus);
+}
 
-export const playerSchema = z.object({
-  id: z.string().uuid(),
-  username: z.string().min(3).max(32).regex(/^[a-zA-Z0-9_-]+$/),
-  email: z.string().email(),
-  avatarUrl: z.string().url().nullable(),
-  xp: z.number().int().nonnegative(),
-  level: z.number().int().positive(),
-  authProvider: z.enum(['email', 'google', 'github', 'discord']),
-  createdAt: dateSchema,
-  updatedAt: dateSchema,
-  stats: playerStatsSchema,
-});
+export function isValidGamePhase(value: string): value is GamePhase {
+  return GAME_PHASES.includes(value as GamePhase);
+}
 
-export const gameSessionSchema = z.object({
-  id: z.string().uuid(),
-  playerId: z.string().uuid(),
-  gameType: z.string().min(1).max(64),
-  score: z.number().int().nonnegative(),
-  duration: z.number().int().positive(),
-  completedAt: dateSchema,
-  metadata: z.record(z.unknown()).optional(),
-});
-
-export const learningProgressSchema = z.object({
-  id: z.string().uuid(),
-  playerId: z.string().uuid(),
-  subject: z.string().min(1).max(64),
-  topic: z.string().min(1).max(128),
-  masteryLevel: z.number().min(0).max(1),
-  lastPracticed: dateSchema,
-});
-
-export const learningModuleSchema = z.object({
-  id: z.string().uuid(),
-  title: z.string().min(1).max(128),
-  description: z.string().min(1).max(1024),
-  difficulty: z.enum(MODULE_DIFFICULTIES),
-  category: z.enum(MODULE_CATEGORIES),
-  prerequisites: z.array(z.string().uuid()),
-  estimatedDuration: z.number().int().positive(),
-  maxScore: z.number().int().positive(),
-  contentVersion: z.string().min(1).max(32),
-  isActive: z.boolean(),
-  createdAt: dateSchema,
-  updatedAt: dateSchema,
-});
-
-export const attemptRecordSchema = z.object({
-  sessionId: z.string().uuid(),
-  score: z.number().int().nonnegative(),
-  duration: z.number().int().positive(),
-  completedAt: dateSchema,
-  metadata: z.record(z.unknown()).optional(),
-});
-
-export const progressTrackingSchema = z.object({
-  playerId: z.string().uuid(),
-  moduleId: z.string().uuid(),
-  completionStatus: z.enum(COMPLETION_STATUSES),
-  bestScore: z.number().int().nonnegative(),
-  attempts: z.number().int().nonnegative(),
-  totalPlayTime: z.number().nonnegative(),
-  lastAttemptAt: dateSchema.nullable(),
-  completedAt: dateSchema.nullable(),
-  masteredAt: dateSchema.nullable(),
-  attemptHistory: z.array(attemptRecordSchema),
-});
-
-export const gameSessionCreateInputSchema = z.object({
-  playerId: z.string().uuid(),
-  moduleId: z.string
+export function isValidAuthProvider(value: string): value is 'email' | 'google' | 'github' | 'discord' {
+  return AUTH_PROVIDERS.includes(value as 'email
