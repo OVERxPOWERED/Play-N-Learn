@@ -1,25 +1,62 @@
 ```typescript
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { PlayerService } from '../../services/playerService';
-import type { Player, CreatePlayerInput, GameSession, LearningProgress } from '../../types/player';
+import { PlayerService } from '@/services/playerService';
+import { PlayerSchema, CreatePlayerInputSchema, UpdatePlayerInputSchema } from '@/domain';
+import type { Player, CreatePlayerInput, UpdatePlayerInput, GameSession, LearningProgress, PaginatedResponse } from '@/types/player';
+import { Result, Ok, Err } from '@/utils/result';
 
-vi.mock('../../api', () => ({
-  api: {
-    post: vi.fn(),
-    get: vi.fn(),
-    put: vi.fn(),
+vi.mock('@/repositories/playerRepository', () => ({
+  PlayerRepository: vi.fn().mockImplementation(() => ({
+    create: vi.fn(),
+    findById: vi.fn(),
+    findByEmail: vi.fn(),
+    findByUsername: vi.fn(),
+    update: vi.fn(),
     delete: vi.fn(),
-  },
+    list: vi.fn(),
+    count: vi.fn(),
+    findGameSessionsByPlayerId: vi.fn(),
+    findLearningProgressByPlayerId: vi.fn(),
+    deleteGameSessionsByPlayerId: vi.fn(),
+    deleteLearningProgressByPlayerId: vi.fn(),
+  })),
 }));
 
-import { api } from '../../api';
+import { PlayerRepository } from '@/repositories/playerRepository';
 
 describe('PlayerService', () => {
   let playerService: PlayerService;
-  const mockApi = vi.mocked(api);
+  let mockRepository: ReturnType<typeof PlayerRepository>;
+
+  const createMockPlayer = (overrides: Partial<Player> = {}): Player => ({
+    id: 'player-123',
+    username: 'testuser',
+    email: 'test@example.com',
+    displayName: 'Test User',
+    level: 1,
+    xp: 0,
+    totalScore: 0,
+    gamesPlayed: 0,
+    createdAt: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+    updatedAt: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+    ...overrides,
+  });
+
+  const createMockCreateInput = (overrides: Partial<CreatePlayerInput> = {}): CreatePlayerInput => ({
+    username: 'testuser',
+    email: 'test@example.com',
+    displayName: 'Test User',
+    ...overrides,
+  });
+
+  const createMockUpdateInput = (overrides: Partial<UpdatePlayerInput> = {}): UpdatePlayerInput => ({
+    displayName: 'Updated Name',
+    ...overrides,
+  });
 
   beforeEach(() => {
-    playerService = new PlayerService();
+    mockRepository = new PlayerRepository() as ReturnType<typeof PlayerRepository>;
+    playerService = new PlayerService(mockRepository);
     vi.clearAllMocks();
   });
 
@@ -28,174 +65,144 @@ describe('PlayerService', () => {
   });
 
   describe('createPlayer', () => {
-    it('should validate input and return Player on success', async () => {
-      const input: CreatePlayerInput = {
-        username: 'testuser',
-        email: 'test@example.com',
-        displayName: 'Test User',
-      };
+    it('should validate input and return Ok(Player) on success', async () => {
+      const input = createMockCreateInput();
+      const expectedPlayer = createMockPlayer();
 
-      const expectedPlayer: Player = {
-        id: 'player-123',
-        username: 'testuser',
-        email: 'test@example.com',
-        displayName: 'Test User',
-        level: 1,
-        xp: 0,
-        totalScore: 0,
-        gamesPlayed: 0,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-
-      mockApi.post.mockResolvedValueOnce({ data: expectedPlayer });
+      mockRepository.findByEmail.mockResolvedValue(null);
+      mockRepository.findByUsername.mockResolvedValue(null);
+      mockRepository.create.mockResolvedValue(expectedPlayer);
 
       const result = await playerService.createPlayer(input);
 
-      expect(mockApi.post).toHaveBeenCalledWith('/players', input);
-      expect(result).toEqual(expectedPlayer);
+      expect(result.isOk()).toBe(true);
+      if (result.isOk()) {
+        expect(result.value).toEqual(expectedPlayer);
+        expect(PlayerSchema.parse(result.value)).toEqual(expectedPlayer);
+      }
+      expect(mockRepository.findByEmail).toHaveBeenCalledWith(input.email);
+      expect(mockRepository.findByUsername).toHaveBeenCalledWith(input.username);
+      expect(mockRepository.create).toHaveBeenCalledWith(expect.objectContaining({
+        username: input.username,
+        email: input.email,
+        displayName: input.displayName,
+      }));
     });
 
-    it('should throw error when username is empty', async () => {
-      const input: CreatePlayerInput = {
-        username: '',
+    it('should return Err when username is empty', async () => {
+      const input = createMockCreateInput({ username: '' });
+
+      const result = await playerService.createPlayer(input);
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.code).toBe('VALIDATION_ERROR');
+        expect(result.error.message).toContain('username');
+      }
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('should return Err when email is invalid', async () => {
+      const input = createMockCreateInput({ email: 'invalid-email' });
+
+      const result = await playerService.createPlayer(input);
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.code).toBe('VALIDATION_ERROR');
+        expect(result.error.message).toContain('email');
+      }
+    });
+
+    it('should return Err when displayName is empty', async () => {
+      const input = createMockCreateInput({ displayName: '' });
+
+      const result = await playerService.createPlayer(input);
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.code).toBe('VALIDATION_ERROR');
+        expect(result.error.message).toContain('displayName');
+      }
+    });
+
+    it('should return Err when email already exists', async () => {
+      const input = createMockCreateInput();
+      const existingPlayer = createMockPlayer({ email: input.email });
+
+      mockRepository.findByEmail.mockResolvedValue(existingPlayer);
+
+      const result = await playerService.createPlayer(input);
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.code).toBe('CONFLICT');
+        expect(result.error.message).toContain('email');
+      }
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('should return Err when username already exists', async () => {
+      const input = createMockCreateInput();
+      const existingPlayer = createMockPlayer({ username: input.username });
+
+      mockRepository.findByEmail.mockResolvedValue(null);
+      mockRepository.findByUsername.mockResolvedValue(existingPlayer);
+
+      const result = await playerService.createPlayer(input);
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.code).toBe('CONFLICT');
+        expect(result.error.message).toContain('username');
+      }
+    });
+
+    it('should return Err when repository create fails', async () => {
+      const input = createMockCreateInput();
+
+      mockRepository.findByEmail.mockResolvedValue(null);
+      mockRepository.findByUsername.mockResolvedValue(null);
+      mockRepository.create.mockRejectedValue(new Error('Database connection failed'));
+
+      const result = await playerService.createPlayer(input);
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) {
+        expect(result.error.code).toBe('INTERNAL_ERROR');
+      }
+    });
+
+    it('should sanitize input before creating', async () => {
+      const input = createMockCreateInput({
+        username: '  testuser  ',
+        email: '  TEST@EXAMPLE.COM  ',
+        displayName: '  Test User  ',
+      });
+      const expectedPlayer = createMockPlayer({
+        username: 'testuser',
         email: 'test@example.com',
         displayName: 'Test User',
-      };
+      });
 
-      await expect(playerService.createPlayer(input)).rejects.toThrow('Username is required');
-      expect(mockApi.post).not.toHaveBeenCalled();
-    });
+      mockRepository.findByEmail.mockResolvedValue(null);
+      mockRepository.findByUsername.mockResolvedValue(null);
+      mockRepository.create.mockResolvedValue(expectedPlayer);
 
-    it('should throw error when email is invalid', async () => {
-      const input: CreatePlayerInput = {
-        username: 'testuser',
-        email: 'invalid-email',
-        displayName: 'Test User',
-      };
+      const result = await playerService.createPlayer(input);
 
-      await expect(playerService.createPlayer(input)).rejects.toThrow('Invalid email format');
-      expect(mockApi.post).not.toHaveBeenCalled();
-    });
-
-    it('should throw error when displayName is empty', async () => {
-      const input: CreatePlayerInput = {
-        username: 'testuser',
-        email: 'test@example.com',
-        displayName: '',
-      };
-
-      await expect(playerService.createPlayer(input)).rejects.toThrow('Display name is required');
-      expect(mockApi.post).not.toHaveBeenCalled();
-    });
-
-    it('should handle API error when player already exists', async () => {
-      const input: CreatePlayerInput = {
-        username: 'existinguser',
-        email: 'existing@example.com',
-        displayName: 'Existing User',
-      };
-
-      const apiError = new Error('Player already exists');
-      (apiError as any).status = 409;
-      mockApi.post.mockRejectedValueOnce(apiError);
-
-      await expect(playerService.createPlayer(input)).rejects.toThrow('Player already exists');
-      expect(mockApi.post).toHaveBeenCalledWith('/players', input);
-    });
-
-    it('should handle generic API errors', async () => {
-      const input: CreatePlayerInput = {
+      expect(result.isOk()).toBe(true);
+      expect(mockRepository.create).toHaveBeenCalledWith(expect.objectContaining({
         username: 'testuser',
         email: 'test@example.com',
         displayName: 'Test User',
-      };
-
-      const apiError = new Error('Internal server error');
-      (apiError as any).status = 500;
-      mockApi.post.mockRejectedValueOnce(apiError);
-
-      await expect(playerService.createPlayer(input)).rejects.toThrow('Internal server error');
+      }));
     });
   });
 
-  describe('calculateLevel', () => {
-    it('should return level 1 for 0 XP', () => {
-      expect(playerService.calculateLevel(0)).toBe(1);
-    });
+  describe('getPlayer', () => {
+    it('should return Ok(Player) when player exists', async () => {
+      const player = createMockPlayer();
+      mockRepository.findById.mockResolvedValue(player);
 
-    it('should return level 1 for XP below first threshold', () => {
-      expect(playerService.calculateLevel(50)).toBe(1);
-      expect(playerService.calculateLevel(99)).toBe(1);
-    });
-
-    it('should return level 2 at 100 XP boundary', () => {
-      expect(playerService.calculateLevel(100)).toBe(2);
-    });
-
-    it('should return level 2 for XP between 100 and 399', () => {
-      expect(playerService.calculateLevel(150)).toBe(2);
-      expect(playerService.calculateLevel(399)).toBe(2);
-    });
-
-    it('should return level 3 at 400 XP boundary', () => {
-      expect(playerService.calculateLevel(400)).toBe(3);
-    });
-
-    it('should return level 3 for XP between 400 and 899', () => {
-      expect(playerService.calculateLevel(500)).toBe(3);
-      expect(playerService.calculateLevel(899)).toBe(3);
-    });
-
-    it('should return level 4 at 900 XP boundary', () => {
-      expect(playerService.calculateLevel(900)).toBe(4);
-    });
-
-    it('should calculate higher levels correctly using XP curve formula', () => {
-      expect(playerService.calculateLevel(1600)).toBe(5);
-      expect(playerService.calculateLevel(2500)).toBe(6);
-      expect(playerService.calculateLevel(3600)).toBe(7);
-      expect(playerService.calculateLevel(4900)).toBe(8);
-      expect(playerService.calculateLevel(6400)).toBe(9);
-      expect(playerService.calculateLevel(8100)).toBe(10);
-    });
-
-    it('should handle very large XP values', () => {
-      expect(playerService.calculateLevel(100000)).toBe(32);
-      expect(playerService.calculateLevel(1000000)).toBe(100);
-    });
-
-    it('should throw error for negative XP', () => {
-      expect(() => playerService.calculateLevel(-1)).toThrow('XP cannot be negative');
-      expect(() => playerService.calculateLevel(-100)).toThrow('XP cannot be negative');
-    });
-  });
-
-  describe('awardXp', () => {
-    const mockPlayer: Player = {
-      id: 'player-123',
-      username: 'testuser',
-      email: 'test@example.com',
-      displayName: 'Test User',
-      level: 1,
-      xp: 50,
-      totalScore: 100,
-      gamesPlayed: 5,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-
-    it('should award XP and return updated player when no level up', async () => {
-      const updatedPlayer: Player = {
-        ...mockPlayer,
-        xp: 100,
-        updatedAt: new Date().toISOString(),
-      };
-
-      mockApi.put.mockResolvedValueOnce({ data: updatedPlayer });
-
-      const result = await playerService.awardXp('player-123', 50);
-
-      expect(mockApi.put).toHaveBeenCalledWith('/players/player-123/xp', { xp: 50 });
-      expect(result).toEqual(updatedPlayer);
-      expect(result
+      const result = await playerService.getPlayer
