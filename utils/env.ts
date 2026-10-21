@@ -6,6 +6,8 @@ interface EnvSchema {
   DATABASE_URL: string;
   NEXTAUTH_SECRET: string;
   NEXTAUTH_URL: string;
+  GAME_API_KEY: string;
+  OGL_CDN_URL: string;
   API_RATE_LIMIT: string;
   REDIS_URL?: string;
 }
@@ -127,6 +129,8 @@ export function parseEnv(): EnvSchema {
     { key: 'DATABASE_URL', validator: validateNonEmpty },
     { key: 'NEXTAUTH_SECRET', validator: validateNonEmpty },
     { key: 'NEXTAUTH_URL', validator: validateUrl },
+    { key: 'GAME_API_KEY', validator: validateNonEmpty },
+    { key: 'OGL_CDN_URL', validator: validateUrl },
     { key: 'API_RATE_LIMIT', validator: validatePositiveInteger },
   ];
 
@@ -150,8 +154,6 @@ export function parseEnv(): EnvSchema {
       if (error instanceof EnvValidationError) {
         missingVars.push(...error.missingVars);
         invalidVars.push(...error.invalidVars);
-      } else {
-        invalidVars.push(key);
       }
     }
   }
@@ -165,8 +167,6 @@ export function parseEnv(): EnvSchema {
       } catch (error) {
         if (error instanceof EnvValidationError) {
           invalidVars.push(...error.invalidVars);
-        } else {
-          invalidVars.push(key);
         }
       }
     }
@@ -181,39 +181,28 @@ export function parseEnv(): EnvSchema {
 }
 
 /**
- * Gets a typed environment variable value
- * @param key - The environment variable key
- * @returns The validated environment variable value
- * @throws EnvValidationError if the variable is not validated or missing
+ * Returns the validated environment configuration
+ * Throws if environment has not been validated yet
+ * @returns Validated environment configuration object
  */
-export function getEnv<K extends keyof EnvSchema>(key: K): EnvSchema[K] {
-  const env = parseEnv();
-  const value = env[key];
-  
-  if (value === undefined) {
-    throw new EnvValidationError([key], []);
+export function getEnv(): EnvSchema {
+  if (!validatedEnv) {
+    return parseEnv();
   }
-  
-  return value;
+  return validatedEnv;
 }
 
 /**
- * Checks if all required environment variables are valid
- * @returns True if all required variables are present and valid
+ * Resets the validated environment cache
+ * Useful for testing or re-validation scenarios
  */
-export function isEnvValid(): boolean {
-  try {
-    parseEnv();
-    return true;
-  } catch {
-    return false;
-  }
+export function resetEnv(): void {
+  validatedEnv = null;
 }
 
-/**
- * Gets all validated environment variables
- * @returns Complete validated environment configuration
- */
-export function getAllEnv(): EnvSchema {
-  return parseEnv();
+// Validate environment on module load in production
+if (process.env.NODE_ENV === 'production') {
+  parseEnv();
 }
+
+export type { EnvSchema };
