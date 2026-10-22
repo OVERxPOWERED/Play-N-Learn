@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { PlayerService } from '@/services/playerService';
 import { telemetry } from '@/utils/telemetry';
-import { validatePlayerCreate, validatePaginationParams } from '@/utils/validation';
+import { validatePlayerCreate, validatePaginationParams, validatePlayerUpdate } from '@/utils/validation';
 
 interface ApiResponse<T> {
   success: boolean;
@@ -23,6 +23,22 @@ interface ApiResponse<T> {
   };
 }
 
+interface PlayerListQuery {
+  page: number;
+  limit: number;
+  sortBy: string;
+  sortOrder: 'asc' | 'desc';
+  search?: string;
+}
+
+interface PlayerListResult {
+  players: unknown[];
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+}
+
 function generateRequestId(): string {
   return `req_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
 }
@@ -31,8 +47,10 @@ function createResponse<T>(
   success: boolean,
   data?: T,
   error?: ApiResponse<T>['error'],
-  meta?: ApiResponse<T>['meta']
+  meta?: ApiResponse<T>['meta'],
+  statusCode?: number
 ): NextResponse<ApiResponse<T>> {
+  const status = statusCode ?? (success ? (data ? 200 : 201) : (error?.code === 'VALIDATION_ERROR' ? 400 : error?.code === 'NOT_FOUND' ? 404 : 500));
   return NextResponse.json(
     {
       success,
@@ -43,7 +61,7 @@ function createResponse<T>(
         timestamp: new Date().toISOString(),
       },
     },
-    { status: success ? (data ? 200 : 201) : (error?.code === 'VALIDATION_ERROR' ? 400 : 500) }
+    { status }
   );
 }
 
@@ -76,7 +94,7 @@ export async function GET(request: NextRequest): Promise<NextResponse<ApiRespons
       sortBy: validation.data!.sortBy,
       sortOrder: validation.data!.sortOrder,
       search,
-    });
+    }) as PlayerListResult;
 
     telemetry.recordApiRequest('players.list', 200, Date.now() - startTime);
 
@@ -133,27 +151,24 @@ export async function POST(request: NextRequest): Promise<NextResponse<ApiRespon
 
     telemetry.recordApiRequest('players.create', 201, Date.now() - startTime);
 
-    return createResponse(true, player, undefined, { requestId });
+    return createResponse(true, player, undefined, { requestId }, 201);
   } catch (error) {
     const duration = Date.now() - startTime;
     
-    if (error instanceof Error && error.message.includes('duplicate')) {
+    if (error instanceof Error && error.message.includes('already exists')) {
       telemetry.recordApiError('players.create', 'CONFLICT', duration);
       return createResponse(false, undefined, {
         code: 'CONFLICT',
-        message: 'Player with this identifier already exists',
-      }, { requestId });
+        message: error.message,
+      }, { requestId }, 409);
     }
-
+    
     telemetry.recordApiError('players.create', 'INTERNAL_ERROR', duration);
     console.error('[API] POST /api/players error:', { requestId, error });
-
+    
     return createResponse(false, undefined, {
       code: 'INTERNAL_ERROR',
       message: 'Failed to create player',
     }, { requestId });
   }
 }
-
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
