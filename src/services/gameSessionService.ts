@@ -1,5 +1,6 @@
 ```typescript
 import { Player, GameSession, GameType, GameSessionStatus } from '@/domain';
+import { telemetryService } from './telemetryService';
 
 export class GameSessionError extends Error {
   constructor(
@@ -37,18 +38,35 @@ export class InvalidSessionStateError extends GameSessionError {
   }
 }
 
-interface CreateSessionInput {
+export interface CreateSessionInput {
   playerId: string;
   gameType: GameType;
+  initialScore?: number;
 }
 
-interface UpdateSessionInput {
+export interface UpdateSessionInput {
   status?: GameSessionStatus;
   score?: number;
   metadata?: Record<string, unknown>;
 }
 
-class GameSessionService {
+export interface ListSessionsOptions {
+  playerId?: string;
+  status?: GameSessionStatus;
+  gameType?: GameType;
+  limit?: number;
+  offset?: number;
+}
+
+const VALID_STATE_TRANSITIONS: Record<GameSessionStatus, GameSessionStatus[]> = {
+  created: ['active', 'abandoned'],
+  active: ['paused', 'completed', 'abandoned'],
+  paused: ['active', 'abandoned'],
+  completed: [],
+  abandoned: [],
+};
+
+export class GameSessionService {
   private sessions: Map<string, GameSession> = new Map();
   private playerSessionsIndex: Map<string, Set<string>> = new Map();
 
@@ -81,6 +99,13 @@ class GameSessionService {
     }
   }
 
+  private validateStateTransition(sessionId: string, currentState: GameSessionStatus, targetState: GameSessionStatus): void {
+    const allowedTransitions = VALID_STATE_TRANSITIONS[currentState];
+    if (!allowedTransitions.includes(targetState)) {
+      throw new InvalidSessionStateError(sessionId, currentState, targetState);
+    }
+  }
+
   private getSessionOrThrow(id: string): GameSession {
     const session = this.sessions.get(id);
     if (!session) {
@@ -106,17 +131,32 @@ class GameSessionService {
     }
   }
 
+  private logOperation(operation: string, sessionId: string, correlationId: string, metadata?: Record<string, unknown>): void {
+    telemetryService.log({
+      level: 'info',
+      message: `GameSessionService.${operation}`,
+      correlationId,
+      metadata: { sessionId, ...metadata },
+    });
+  }
+
   createSession(input: CreateSessionInput): GameSession {
+    const correlationId = telemetryService.generateCorrelationId();
+    
     this.validatePlayerId(input.playerId);
     this.validateGameType(input.gameType);
+    
+    if (input.initialScore !== undefined) {
+      this.validateScore(input.initialScore);
+    }
 
     const now = new Date();
     const session: GameSession = {
       id: this.generateId(),
       playerId: input.playerId,
       gameType: input.gameType,
-      status: 'active',
-      score: 0,
+      status: 'created',
+      score: input.initialScore ?? 0,
       startedAt: now,
       updatedAt: now,
       metadata: {},
@@ -125,98 +165,65 @@ class GameSessionService {
     this.sessions.set(session.id, session);
     this.addToPlayerIndex(input.playerId, session.id);
 
+    this.logOperation('createSession', session.id, correlationId, { 
+      playerId: input.playerId, 
+      gameType: input.gameType,
+      initialScore: input.initialScore 
+    });
+
     return { ...session };
   }
 
   getSession(id: string): GameSession {
+    const correlationId = telemetryService.generateCorrelationId();
     const session = this.getSessionOrThrow(id);
+    
+    this.logOperation('getSession', id, correlationId);
+    
     return { ...session };
   }
 
   updateSession(id: string, updates: UpdateSessionInput): GameSession {
+    const correlationId = telemetryService.generateCorrelationId();
     const session = this.getSessionOrThrow(id);
-
+    
     if (updates.status !== undefined) {
-      const validStatuses: GameSessionStatus[] = ['active', 'paused', 'completed', 'abandoned'];
-      if (!validStatuses.includes(updates.status)) {
-        throw new SessionValidationError(`Invalid status: ${updates.status}`);
-      }
-      session.status = updates.status;
+      this.validateStateTransition(id, session.status, updates.status);
     }
-
+    
     if (updates.score !== undefined) {
       this.validateScore(updates.score);
-      session.score = updates.score;
     }
 
-    if (updates.metadata !== undefined) {
-      if (typeof updates.metadata !== 'object' || updates.metadata === null) {
-        throw new SessionValidationError('Metadata must be an object');
-      }
-      session.metadata = { ...session.metadata, ...updates.metadata };
-    }
+    const updatedSession: GameSession = {
+      ...session,
+      status: updates.status ?? session.status,
+      score: updates.score ?? session.score,
+      metadata: { ...session.metadata, ...updates.metadata },
+      updatedAt: new Date(),
+    };
 
-    session.updatedAt = new Date();
-    this.sessions.set(id, session);
+    this.sessions.set(id, updatedSession);
 
-    return { ...session };
+    this.logOperation('updateSession', id, correlationId, { 
+      updates: Object.keys(updates),
+      previousStatus: session.status,
+      newStatus: updatedSession.status 
+    });
+
+    return { ...updatedSession };
   }
 
-  completeSession(id: string, score: number): GameSession {
-    this.validateScore(score);
-
+  deleteSession(id: string): void {
+    const correlationId = telemetryService.generateCorrelationId();
     const session = this.getSessionOrThrow(id);
+    
+    this.sessions.delete(id);
+    this.removeFromPlayerIndex(session.playerId, id);
 
-    if (session.status === 'completed') {
-      throw new InvalidSessionStateError(id, session.status, 'active');
-    }
-    if (session.status === 'abandoned') {
-      throw new InvalidSessionStateError(id, session.status, 'active');
-    }
-
-    session.status = 'completed';
-    session.score = score;
-    session.completedAt = new Date();
-    session.updatedAt = new Date();
-
-    this.sessions.set(id, session);
-
-    return { ...session };
+    this.logOperation('deleteSession', id, correlationId, { playerId: session.playerId });
   }
 
-  abandonSession(id: string): GameSession {
-    const session = this.getSessionOrThrow(id);
-
-    if (session.status === 'completed') {
-      throw new InvalidSessionStateError(id, session.status, 'active');
-    }
-    if (session.status === 'abandoned') {
-      throw new InvalidSessionStateError(id, session.status, 'active');
-    }
-
-    session.status = 'abandoned';
-    session.completedAt = new Date();
-    session.updatedAt = new Date();
-
-    this.sessions.set(id, session);
-
-    return { ...session };
-  }
-
-  listPlayerSessions(playerId: string): GameSession[] {
-    this.validatePlayerId(playerId);
-
-    const sessionIds = this.playerSessionsIndex.get(playerId);
-    if (!sessionIds || sessionIds.size === 0) {
-      return [];
-    }
-
-    const sessions: GameSession[] = [];
-    for (const sessionId of sessionIds) {
-      const session = this.sessions.get(sessionId);
-      if (session) {
-        sessions.push({ ...session });
-      }
-    }
-
-    return sessions.sort((a, b
+  listSessions(options: ListSessionsOptions = {}): GameSession[] {
+    const correlationId = telemetryService.generateCorrelationId();
+    let sessions = Array.from
