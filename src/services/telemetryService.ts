@@ -1,4 +1,3 @@
-```typescript
 import { randomUUID } from 'crypto';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'fatal';
@@ -14,6 +13,7 @@ export interface TelemetryContext {
   operation?: string;
   component?: string;
   metadata?: Record<string, unknown>;
+  correlationId?: string;
 }
 
 export interface TelemetryEvent {
@@ -55,6 +55,49 @@ export interface StructuredLogEntry {
   error?: TelemetryError['error'];
   metric?: PerformanceMetric;
   event?: TelemetryEvent;
+}
+
+export interface SessionCreatedEvent {
+  sessionId: string;
+  playerId: string;
+  gameType: string;
+  correlationId?: string;
+}
+
+export interface SessionStartedEvent {
+  sessionId: string;
+  correlationId?: string;
+}
+
+export interface SessionPausedEvent {
+  sessionId: string;
+  duration: number;
+  correlationId?: string;
+}
+
+export interface SessionResumedEvent {
+  sessionId: string;
+  correlationId?: string;
+}
+
+export interface SessionCompletedEvent {
+  sessionId: string;
+  score: number;
+  duration: number;
+  correlationId?: string;
+}
+
+export interface SessionAbandonedEvent {
+  sessionId: string;
+  reason: string;
+  correlationId?: string;
+}
+
+export interface SessionErrorEvent {
+  sessionId: string;
+  errorCode: string;
+  errorMessage: string;
+  correlationId?: string;
 }
 
 const SERVICE_NAME = process.env.SERVICE_NAME || 'nextjs-app';
@@ -114,6 +157,8 @@ function writeLog(entry: StructuredLogEntry): void {
     case 'fatal':
       console.error(logLine);
       break;
+    default:
+      console.log(logLine);
   }
 }
 
@@ -168,95 +213,262 @@ function classifyError(error: unknown): ErrorClassification {
   return 'system';
 }
 
-function extractErrorDetails(error: unknown): TelemetryError['error'] {
-  if (error instanceof Error) {
-    return {
-      name: error.name,
-      message: error.message,
-      stack: error.stack,
-      classification: classifyError(error),
-      code: (error as NodeJS.ErrnoException).code,
-      statusCode: (error as { statusCode?: number }).statusCode,
-    };
-  }
-  
-  if (typeof error === 'string') {
-    return {
-      name: 'Error',
-      message: error,
-      classification: 'system',
-    };
-  }
-  
-  if (error && typeof error === 'object' && 'message' in error) {
-    const err = error as { message: string; name?: string; stack?: string; code?: string; statusCode?: number };
-    return {
-      name: err.name || 'Error',
-      message: err.message,
-      stack: err.stack,
-      classification: classifyError(error),
-      code: err.code,
-      statusCode: err.statusCode,
-    };
-  }
-  
-  return {
-    name: 'UnknownError',
-    message: String(error),
-    classification: 'system',
-  };
-}
-
 class TelemetryService {
-  private static instance: TelemetryService;
   private sampleRate: number;
   private enabled: boolean;
-  private customTags: Record<string, string>;
 
-  private constructor() {
+  constructor() {
     this.sampleRate = DEFAULT_SAMPLE_RATE;
     this.enabled = process.env.TELEMETRY_ENABLED !== 'false';
-    this.customTags = {};
   }
 
-  static getInstance(): TelemetryService {
-    if (!TelemetryService.instance) {
-      TelemetryService.instance = new TelemetryService();
-    }
-    return TelemetryService.instance;
+  setSampleRate(rate: number): void {
+    this.sampleRate = Math.max(0, Math.min(1, rate));
   }
 
-  configure(options: { sampleRate?: number; enabled?: boolean; customTags?: Record<string, string> } = {}): void {
-    if (options.sampleRate !== undefined) {
-      this.sampleRate = Math.max(0, Math.min(1, options.sampleRate));
-    }
-    if (options.enabled !== undefined) {
-      this.enabled = options.enabled;
-    }
-    if (options.customTags) {
-      this.customTags = { ...this.customTags, ...options.customTags };
-    }
+  setEnabled(enabled: boolean): void {
+    this.enabled = enabled;
   }
 
-  private getContextFromHeaders(headers: Headers | Record<string, string | undefined>): TelemetryContext {
-    const headerObj = headers instanceof Headers 
-      ? Object.fromEntries(headers.entries()) 
-      : headers;
-
-    return {
-      traceId: headerObj['x-trace-id'] || headerObj['trace-id'] || headerObj['x-request-id'],
-      spanId: headerObj['x-span-id'] || headerObj['span-id'],
-      userId: headerObj['x-user-id'] || headerObj['user-id'],
-      sessionId: headerObj['x-session-id'] || headerObj['session-id'],
-      requestId: headerObj['x-request-id'] || headerObj['request-id'],
-    };
-  }
-
-  trackEvent(eventName: string, properties?: Record<string, unknown>, context?: TelemetryContext): void {
+  private log(
+    level: LogLevel,
+    message: string,
+    context?: TelemetryContext,
+    error?: TelemetryError['error'],
+    metric?: PerformanceMetric,
+    event?: TelemetryEvent
+  ): void {
     if (!this.enabled || !shouldSample(this.sampleRate)) {
       return;
     }
 
-    const enrichedContext: TelemetryContext = {
-      ...context,
-      ...
+    const entry = createStructuredLogEntry(level, message, context, error, metric, event);
+    writeLog(entry);
+  }
+
+  debug(message: string, context?: TelemetryContext): void {
+    this.log('debug', message, context);
+  }
+
+  info(message: string, context?: TelemetryContext): void {
+    this.log('info', message, context);
+  }
+
+  warn(message: string, context?: TelemetryContext): void {
+    this.log('warn', message, context);
+  }
+
+  error(message: string, context?: TelemetryContext, error?: Error): void {
+    const classifiedError = error ? {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+      classification: classifyError(error),
+    } : undefined;
+    this.log('error', message, context, classifiedError);
+  }
+
+  fatal(message: string, context?: TelemetryContext, error?: Error): void {
+    const classifiedError = error ? {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+      classification: classifyError(error),
+    } : undefined;
+    this.log('fatal', message, context, classifiedError);
+  }
+
+  trackEvent(event: TelemetryEvent): void {
+    this.log(event.level, `Event: ${event.name}`, event.context, undefined, undefined, event);
+  }
+
+  trackError(error: TelemetryError): void {
+    this.log(error.level, `Error: ${error.name}`, error.context, error.error);
+  }
+
+  trackMetric(metric: PerformanceMetric): void {
+    this.log('info', `Metric: ${metric.operation}`, metric.context, undefined, metric);
+  }
+
+  trackSessionCreated(data: SessionCreatedEvent): void {
+    const context: TelemetryContext = {
+      sessionId: data.sessionId,
+      userId: data.playerId,
+      operation: 'session.created',
+      component: 'game-session',
+      correlationId: data.correlationId,
+      metadata: {
+        gameType: data.gameType,
+      },
+    };
+
+    const event: TelemetryEvent = {
+      name: 'session.created',
+      properties: {
+        sessionId: data.sessionId,
+        playerId: data.playerId,
+        gameType: data.gameType,
+      },
+      context,
+      timestamp: new Date().toISOString(),
+      level: 'info',
+    };
+
+    this.trackEvent(event);
+  }
+
+  trackSessionStarted(data: SessionStartedEvent): void {
+    const context: TelemetryContext = {
+      sessionId: data.sessionId,
+      operation: 'session.started',
+      component: 'game-session',
+      correlationId: data.correlationId,
+    };
+
+    const event: TelemetryEvent = {
+      name: 'session.started',
+      properties: {
+        sessionId: data.sessionId,
+      },
+      context,
+      timestamp: new Date().toISOString(),
+      level: 'info',
+    };
+
+    this.trackEvent(event);
+  }
+
+  trackSessionPaused(data: SessionPausedEvent): void {
+    const context: TelemetryContext = {
+      sessionId: data.sessionId,
+      operation: 'session.paused',
+      component: 'game-session',
+      correlationId: data.correlationId,
+      metadata: {
+        duration: data.duration,
+      },
+    };
+
+    const event: TelemetryEvent = {
+      name: 'session.paused',
+      properties: {
+        sessionId: data.sessionId,
+        duration: data.duration,
+      },
+      context,
+      timestamp: new Date().toISOString(),
+      level: 'info',
+    };
+
+    this.trackEvent(event);
+  }
+
+  trackSessionResumed(data: SessionResumedEvent): void {
+    const context: TelemetryContext = {
+      sessionId: data.sessionId,
+      operation: 'session.resumed',
+      component: 'game-session',
+      correlationId: data.correlationId,
+    };
+
+    const event: TelemetryEvent = {
+      name: 'session.resumed',
+      properties: {
+        sessionId: data.sessionId,
+      },
+      context,
+      timestamp: new Date().toISOString(),
+      level: 'info',
+    };
+
+    this.trackEvent(event);
+  }
+
+  trackSessionCompleted(data: SessionCompletedEvent): void {
+    const context: TelemetryContext = {
+      sessionId: data.sessionId,
+      operation: 'session.completed',
+      component: 'game-session',
+      correlationId: data.correlationId,
+      metadata: {
+        score: data.score,
+        duration: data.duration,
+      },
+    };
+
+    const event: TelemetryEvent = {
+      name: 'session.completed',
+      properties: {
+        sessionId: data.sessionId,
+        score: data.score,
+        duration: data.duration,
+      },
+      context,
+      timestamp: new Date().toISOString(),
+      level: 'info',
+    };
+
+    this.trackEvent(event);
+  }
+
+  trackSessionAbandoned(data: SessionAbandonedEvent): void {
+    const context: TelemetryContext = {
+      sessionId: data.sessionId,
+      operation: 'session.abandoned',
+      component: 'game-session',
+      correlationId: data.correlationId,
+      metadata: {
+        reason: data.reason,
+      },
+    };
+
+    const event: TelemetryEvent = {
+      name: 'session.abandoned',
+      properties: {
+        sessionId: data.sessionId,
+        reason: data.reason,
+      },
+      context,
+      timestamp: new Date().toISOString(),
+      level: 'warn',
+    };
+
+    this.trackEvent(event);
+  }
+
+  trackSessionError(data: SessionErrorEvent): void {
+    const context: TelemetryContext = {
+      sessionId: data.sessionId,
+      operation: 'session.error',
+      component: 'game-session',
+      correlationId: data.correlationId,
+      metadata: {
+        errorCode: data.errorCode,
+        errorMessage: data.errorMessage,
+      },
+    };
+
+    const error: TelemetryError = {
+      name: 'session.error',
+      properties: {
+        sessionId: data.sessionId,
+        errorCode: data.errorCode,
+        errorMessage: data.errorMessage,
+      },
+      context,
+      timestamp: new Date().toISOString(),
+      level: 'error',
+      error: {
+        name: 'SessionError',
+        message: data.errorMessage,
+        classification: 'system',
+        code: data.errorCode,
+      },
+    };
+
+    this.trackError(error);
+  }
+}
+
+export const telemetryService = new TelemetryService();
+export default telemetryService;
