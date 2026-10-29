@@ -1,4 +1,3 @@
-```typescript
 import { Player, GameSession, GameType, GameSessionStatus } from '@/domain';
 import { telemetryService } from './telemetryService';
 
@@ -131,18 +130,30 @@ export class GameSessionService {
     }
   }
 
-  private logOperation(operation: string, sessionId: string, correlationId: string, metadata?: Record<string, unknown>): void {
-    telemetryService.log({
-      level: 'info',
-      message: `GameSessionService.${operation}`,
-      correlationId,
-      metadata: { sessionId, ...metadata },
+  private transitionState(sessionId: string, targetState: GameSessionStatus): GameSession {
+    const session = this.getSessionOrThrow(sessionId);
+    this.validateStateTransition(sessionId, session.status, targetState);
+    
+    const updatedSession: GameSession = {
+      ...session,
+      status: targetState,
+      updatedAt: new Date(),
+    };
+    
+    this.sessions.set(sessionId, updatedSession);
+    
+    telemetryService.track('session_state_changed', {
+      sessionId,
+      previousState: session.status,
+      newState: targetState,
+      playerId: session.playerId,
+      gameType: session.gameType,
     });
+    
+    return updatedSession;
   }
 
   createSession(input: CreateSessionInput): GameSession {
-    const correlationId = telemetryService.generateCorrelationId();
-    
     this.validatePlayerId(input.playerId);
     this.validateGameType(input.gameType);
     
@@ -157,38 +168,33 @@ export class GameSessionService {
       gameType: input.gameType,
       status: 'created',
       score: input.initialScore ?? 0,
-      startedAt: now,
-      updatedAt: now,
       metadata: {},
+      createdAt: now,
+      updatedAt: now,
     };
 
     this.sessions.set(session.id, session);
     this.addToPlayerIndex(input.playerId, session.id);
 
-    this.logOperation('createSession', session.id, correlationId, { 
-      playerId: input.playerId, 
-      gameType: input.gameType,
-      initialScore: input.initialScore 
+    telemetryService.track('session_created', {
+      sessionId: session.id,
+      playerId: session.playerId,
+      gameType: session.gameType,
+      initialScore: session.score,
     });
 
-    return { ...session };
+    return session;
   }
 
-  getSession(id: string): GameSession {
-    const correlationId = telemetryService.generateCorrelationId();
-    const session = this.getSessionOrThrow(id);
-    
-    this.logOperation('getSession', id, correlationId);
-    
-    return { ...session };
+  getSession(sessionId: string): GameSession {
+    return this.getSessionOrThrow(sessionId);
   }
 
-  updateSession(id: string, updates: UpdateSessionInput): GameSession {
-    const correlationId = telemetryService.generateCorrelationId();
-    const session = this.getSessionOrThrow(id);
+  updateSession(sessionId: string, updates: UpdateSessionInput): GameSession {
+    const session = this.getSessionOrThrow(sessionId);
     
     if (updates.status !== undefined) {
-      this.validateStateTransition(id, session.status, updates.status);
+      this.validateStateTransition(sessionId, session.status, updates.status);
     }
     
     if (updates.score !== undefined) {
@@ -197,33 +203,102 @@ export class GameSessionService {
 
     const updatedSession: GameSession = {
       ...session,
-      status: updates.status ?? session.status,
-      score: updates.score ?? session.score,
-      metadata: { ...session.metadata, ...updates.metadata },
+      ...updates,
+      metadata: {
+        ...session.metadata,
+        ...updates.metadata,
+      },
       updatedAt: new Date(),
     };
 
-    this.sessions.set(id, updatedSession);
+    this.sessions.set(sessionId, updatedSession);
 
-    this.logOperation('updateSession', id, correlationId, { 
-      updates: Object.keys(updates),
-      previousStatus: session.status,
-      newStatus: updatedSession.status 
+    telemetryService.track('session_updated', {
+      sessionId,
+      playerId: session.playerId,
+      changes: Object.keys(updates),
     });
 
-    return { ...updatedSession };
+    return updatedSession;
   }
 
-  deleteSession(id: string): void {
-    const correlationId = telemetryService.generateCorrelationId();
-    const session = this.getSessionOrThrow(id);
+  deleteSession(sessionId: string): void {
+    const session = this.getSessionOrThrow(sessionId);
     
-    this.sessions.delete(id);
-    this.removeFromPlayerIndex(session.playerId, id);
+    this.sessions.delete(sessionId);
+    this.removeFromPlayerIndex(session.playerId, sessionId);
 
-    this.logOperation('deleteSession', id, correlationId, { playerId: session.playerId });
+    telemetryService.track('session_deleted', {
+      sessionId,
+      playerId: session.playerId,
+      gameType: session.gameType,
+      status: session.status,
+    });
   }
 
   listSessions(options: ListSessionsOptions = {}): GameSession[] {
-    const correlationId = telemetryService.generateCorrelationId();
-    let sessions = Array.from
+    let sessions = Array.from(this.sessions.values());
+
+    if (options.playerId) {
+      sessions = sessions.filter(s => s.playerId === options.playerId);
+    }
+    if (options.status) {
+      sessions = sessions.filter(s => s.status === options.status);
+    }
+    if (options.gameType) {
+      sessions = sessions.filter(s => s.gameType === options.gameType);
+    }
+
+    sessions.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+
+    const offset = options.offset ?? 0;
+    const limit = options.limit ?? 50;
+
+    return sessions.slice(offset, offset + limit);
+  }
+
+  startSession(sessionId: string): GameSession {
+    return this.transitionState(sessionId, 'active');
+  }
+
+  pauseSession(sessionId: string): GameSession {
+    return this.transitionState(sessionId, 'paused');
+  }
+
+  resumeSession(sessionId: string): GameSession {
+    return this.transitionState(sessionId, 'active');
+  }
+
+  completeSession(sessionId: string, score: number): GameSession {
+    this.validateScore(score);
+    
+    const session = this.getSessionOrThrow(sessionId);
+    this.validateStateTransition(sessionId, session.status, 'completed');
+
+    const updatedSession: GameSession = {
+      ...session,
+      status: 'completed',
+      score,
+      completedAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    this.sessions.set(sessionId, updatedSession);
+
+    telemetryService.track('session_completed', {
+      sessionId,
+      playerId: session.playerId,
+      gameType: session.gameType,
+      finalScore: score,
+      durationMs: updatedSession.completedAt.getTime() - session.createdAt.getTime(),
+    });
+
+    return updatedSession;
+  }
+
+  abandonSession(sessionId: string): GameSession {
+    return this.transitionState(sessionId, 'abandoned');
+  }
+}
+
+export const gameSessionService = new GameSessionService();
