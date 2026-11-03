@@ -1,5 +1,5 @@
-```typescript
 import { z } from 'zod';
+import { NextRequest, NextResponse } from 'next/server';
 
 // Re-export Zod for consumers who need it
 export { z };
@@ -125,7 +125,7 @@ export function sanitizeString(input: string, options: {
  * Sanitizes input for safe use in SQL queries (parameterized queries should be used instead)
  * This is a defense-in-depth measure, NOT a replacement for parameterized queries
  */
-export function sanitizeForSql(input: string): string {
+export function sanitizeSql(input: string): string {
   if (typeof input !== 'string') {
     return '';
   }
@@ -139,40 +139,292 @@ export function sanitizeForSql(input: string): string {
     .replace(/\b(SELECT|INSERT|UPDATE|DELETE|DROP|UNION|ALTER|CREATE|EXEC|EXECUTE)\b/gi, '');
 }
 
-// ============================================
-// Validation Functions
-// ============================================
+/**
+ * Sanitizes file paths to prevent directory traversal attacks
+ */
+export function sanitizePath(input: string): string {
+  if (typeof input !== 'string') {
+    return '';
+  }
+  
+  return input
+    .replace(/\.\./g, '')
+    .replace(/\/+/g, '/')
+    .replace(/\\+/g, '/')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '');
+}
 
 /**
- * Validates email format with additional security checks
+ * Sanitizes HTML content allowing only safe tags and attributes
  */
-export function validateEmail(email: string): { valid: boolean; error?: string } {
-  if (typeof email !== 'string') {
-    return { valid: false, error: 'Email must be a string' };
+export function sanitizeHtml(input: string, allowedTags: string[] = ['b', 'i', 'em', 'strong', 'p', 'br', 'ul', 'ol', 'li']): string {
+  if (typeof input !== 'string') {
+    return '';
   }
-
-  const trimmed = email.trim().toLowerCase();
   
-  if (trimmed.length === 0) {
-    return { valid: false, error: 'Email is required' };
-  }
+  const tagRegex = /<\/?([a-z][a-z0-9]*)\b[^>]*>/gi;
+  return input.replace(tagRegex, (match, tagName) => {
+    const lowerTag = tagName.toLowerCase();
+    if (allowedTags.includes(lowerTag)) {
+      // Remove any attributes from allowed tags for safety
+      return match.replace(/\s+[a-z-]+(\s*=\s*(".*?"|'.*?'|[^'">\s]+))?/gi, '');
+    }
+    return '';
+  });
+}
 
-  if (trimmed.length > 255) {
-    return { valid: false, error: 'Email must be at most 255 characters' };
-  }
-
-  // Basic email regex (RFC 5322 compliant simplified)
-  const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
+/**
+ * Deep sanitizes an object, applying sanitizeString to all string values
+ */
+export function sanitizeObject<T extends Record<string, unknown>>(obj: T, options?: Parameters<typeof sanitizeString>[1]): T {
+  const sanitized: Record<string, unknown> = {};
   
-  if (!emailRegex.test(trimmed)) {
-    return { valid: false, error: 'Invalid email format' };
+  for (const [key, value] of Object.entries(obj)) {
+    if (typeof value === 'string') {
+      sanitized[key] = sanitizeString(value, options);
+    } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+      sanitized[key] = sanitizeObject(value as Record<string, unknown>, options);
+    } else if (Array.isArray(value)) {
+      sanitized[key] = value.map(item => 
+        typeof item === 'string' ? sanitizeString(item, options) : 
+        item && typeof item === 'object' ? sanitizeObject(item as Record<string, unknown>, options) : item
+      );
+    } else {
+      sanitized[key] = value;
+    }
   }
+  
+  return sanitized as T;
+}
 
-  // Check for suspicious patterns
-  if (trimmed.includes('..') || trimmed.startsWith('.') || trimmed.endsWith('.')) {
-    return { valid: false, error: 'Invalid email format' };
-  }
+// ============================================
+// Validation Middleware
+// ============================================
 
-  // Check domain part
-  const [localPart, domain] = trimmed.split('@');
-  if
+export interface ValidationError {
+  field: string;
+  message: string;
+  code: string;
+  received?: unknown;
+}
+
+export interface ValidationResult<T> {
+  success: boolean;
+  data?: T;
+  errors?: ValidationError[];
+}
+
+function formatZodError(error: z.ZodError): ValidationError[] {
+  return error.errors.map(err => ({
+    field: err.path.join('.'),
+    message: err.message,
+    code: err.code,
+    received: err.received,
+  }));
+}
+
+/**
+ * Creates a validation middleware for request body
+ */
+export function validateBody<T extends z.ZodSchema>(schema: T) {
+  return async (request: NextRequest): Promise<ValidationResult<z.infer<T>>> => {
+    try {
+      const body = await request.json();
+      const sanitizedBody = sanitizeObject(body);
+      const result = schema.safeParse(sanitizedBody);
+      
+      if (!result.success) {
+        return {
+          success: false,
+          errors: formatZodError(result.error),
+        };
+      }
+      
+      return {
+        success: true,
+        data: result.data,
+      };
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        return {
+          success: false,
+          errors: [{
+            field: 'body',
+            message: 'Invalid JSON in request body',
+            code: 'invalid_json',
+          }],
+        };
+      }
+      throw error;
+    }
+  };
+}
+
+/**
+ * Creates a validation middleware for query parameters
+ */
+export function validateQuery<T extends z.ZodSchema>(schema: T) {
+  return (request: NextRequest): ValidationResult<z.infer<T>> => {
+    const searchParams = request.nextUrl.searchParams;
+    const queryObj: Record<string, string | string[]> = {};
+    
+    for (const [key, value] of searchParams.entries()) {
+      if (queryObj[key]) {
+        if (Array.isArray(queryObj[key])) {
+          (queryObj[key] as string[]).push(value);
+        } else {
+          queryObj[key] = [queryObj[key] as string, value];
+        }
+      } else {
+        queryObj[key] = value;
+      }
+    }
+    
+    const sanitizedQuery = sanitizeObject(queryObj);
+    const result = schema.safeParse(sanitizedQuery);
+    
+    if (!result.success) {
+      return {
+        success: false,
+        errors: formatZodError(result.error),
+      };
+    }
+    
+    return {
+      success: true,
+      data: result.data,
+    };
+  };
+}
+
+/**
+ * Creates a validation middleware for route parameters
+ */
+export function validateParams<T extends z.ZodSchema>(schema: T) {
+  return (params: Record<string, string>): ValidationResult<z.infer<T>> => {
+    const sanitizedParams = sanitizeObject(params);
+    const result = schema.safeParse(sanitizedParams);
+    
+    if (!result.success) {
+      return {
+        success: false,
+        errors: formatZodError(result.error),
+      };
+    }
+    
+    return {
+      success: true,
+      data: result.data,
+    };
+  };
+}
+
+// ============================================
+// API Route Wrapper
+// ============================================
+
+export interface ValidationSchemas {
+  body?: z.ZodSchema;
+  query?: z.ZodSchema;
+  params?: z.ZodSchema;
+}
+
+export type ApiHandler<T = unknown> = (
+  request: NextRequest,
+  context: { params: Promise<Record<string, string>>; validatedData: T }
+) => Promise<NextResponse>;
+
+export function withValidation<T extends ValidationSchemas>(
+  handler: ApiHandler,
+  schemas: T
+) {
+  return async (request: NextRequest, context: { params: Promise<Record<string, string>> }): Promise<NextResponse> => {
+    const validatedData: Record<string, unknown> = {};
+    
+    // Validate params if schema provided
+    if (schemas.params) {
+      const params = await context.params;
+      const paramsResult = validateParams(schemas.params)(params);
+      if (!paramsResult.success) {
+        return NextResponse.json(
+          { 
+            error: 'Validation failed', 
+            details: paramsResult.errors,
+            code: 'VALIDATION_ERROR'
+          },
+          { status: 400 }
+        );
+      }
+      validatedData.params = paramsResult.data;
+    }
+    
+    // Validate query if schema provided
+    if (schemas.query) {
+      const queryResult = validateQuery(schemas.query)(request);
+      if (!queryResult.success) {
+        return NextResponse.json(
+          { 
+            error: 'Validation failed', 
+            details: queryResult.errors,
+            code: 'VALIDATION_ERROR'
+          },
+          { status: 400 }
+        );
+      }
+      validatedData.query = queryResult.data;
+    }
+    
+    // Validate body if schema provided
+    if (schemas.body) {
+      const bodyResult = await validateBody(schemas.body)(request);
+      if (!bodyResult.success) {
+        return NextResponse.json(
+          { 
+            error: 'Validation failed', 
+            details: bodyResult.errors,
+            code: 'VALIDATION_ERROR'
+          },
+          { status: 400 }
+        );
+      }
+      validatedData.body = bodyResult.data;
+    }
+    
+    // Call the handler with validated data
+    return handler(request, { 
+      params: context.params, 
+      validatedData: validatedData as T 
+    });
+  };
+}
+
+// ============================================
+// Pre-built Validation Schemas for Common Use Cases
+// ============================================
+
+export const PaginationQuerySchema = z.object({
+  page: z.coerce.number().int().positive().default(1),
+  limit: z.coerce.number().int().positive().max(100).default(20),
+  sortBy: z.string().optional(),
+  sortOrder: z.enum(['asc', 'desc']).default('desc'),
+});
+
+export const IdParamSchema = z.object({
+  id: z.string().uuid('Invalid ID format'),
+});
+
+export const UuidParamSchema = z.object({
+  uuid: z.string().uuid('Invalid UUID format'),
+});
+
+// ============================================
+// Utility: Create validated API route handlers
+// ============================================
+
+export function createValidatedHandler<T extends ValidationSchemas>(
+  schemas: T,
+  handler: ApiHandler
+) {
+  return withValidation(handler, schemas);
+}
