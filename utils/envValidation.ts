@@ -71,6 +71,20 @@ function parseBoolean(value: string | undefined, defaultValue = false): boolean 
 }
 
 /**
+ * Validates NODE_ENV is one of the allowed values
+ */
+function validateNodeEnv(value: string | undefined): 'development' | 'production' | 'test' {
+  const allowed = ['development', 'production', 'test'] as const;
+  const env = (value || 'development').toLowerCase();
+  
+  if (!allowed.includes(env as typeof allowed[number])) {
+    throw new Error(`NODE_ENV must be one of: ${allowed.join(', ')}, got: ${env}`);
+  }
+  
+  return env as 'development' | 'production' | 'test';
+}
+
+/**
  * Validates all environment variables and returns typed configuration.
  * Throws descriptive errors on missing or invalid configuration.
  * Implements fail-fast behavior for application startup.
@@ -150,55 +164,44 @@ export function validateEnv(): EnvConfig {
   // Optional: OGL debug mode (defaults to false)
   config.NEXT_PUBLIC_OGL_DEBUG = parseBoolean(process.env.NEXT_PUBLIC_OGL_DEBUG, false);
 
-  // Optional: Node environment (defaults to development)
-  const nodeEnv = process.env.NODE_ENV;
-  if (nodeEnv === 'production' || nodeEnv === 'test') {
-    config.NODE_ENV = nodeEnv;
-  } else {
-    config.NODE_ENV = 'development';
+  // Optional: NODE_ENV with validation (defaults to development)
+  try {
+    config.NODE_ENV = validateNodeEnv(process.env.NODE_ENV);
+  } catch (e) {
+    errors.push(e instanceof Error ? e.message : String(e));
   }
 
-  // If any errors collected, throw aggregated error
+  // Throw aggregated error if any validation failed
   if (errors.length > 0) {
     const errorMessage = [
-      'Environment validation failed at startup:',
+      'Environment validation failed:',
       ...errors.map((err, i) => `  ${i + 1}. ${err}`),
       '',
-      'Please check your .env file or deployment environment configuration.',
+      'Please check your .env file and ensure all required variables are set correctly.',
     ].join('\n');
     
     throw new Error(errorMessage);
   }
 
-  // Cache and return fully validated config
+  // Cache and return the validated configuration
   validatedEnv = config as EnvConfig;
   return validatedEnv;
 }
 
 /**
- * Returns validated environment configuration.
- * Calls validateEnv() if not already validated.
- * Use this in application code to access typed environment variables.
+ * Get validated environment config (throws if not validated yet)
+ * Use this in modules that need access to validated env after startup
  */
-export function getEnv(): EnvConfig {
+export function getValidatedEnv(): EnvConfig {
   if (!validatedEnv) {
-    return validateEnv();
+    throw new Error('Environment not validated. Call validateEnv() first during application startup.');
   }
   return validatedEnv;
 }
 
 /**
- * Resets the validation cache. Primarily useful for testing.
- * @internal
+ * Reset the cached environment (useful for testing)
  */
-export function resetEnvValidation(): void {
+export function resetValidatedEnv(): void {
   validatedEnv = null;
-}
-
-/**
- * Checks if environment has been validated without throwing.
- * Useful for health checks or conditional initialization.
- */
-export function isEnvValidated(): boolean {
-  return validatedEnv !== null;
 }
