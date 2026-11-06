@@ -41,6 +41,7 @@ export interface CreateSessionInput {
   playerId: string;
   gameType: GameType;
   initialScore?: number;
+  metadata?: Record<string, unknown>;
 }
 
 export interface UpdateSessionInput {
@@ -130,33 +131,21 @@ export class GameSessionService {
     }
   }
 
-  private transitionState(sessionId: string, targetState: GameSessionStatus): GameSession {
-    const session = this.getSessionOrThrow(sessionId);
-    this.validateStateTransition(sessionId, session.status, targetState);
-    
-    const updatedSession: GameSession = {
-      ...session,
-      status: targetState,
-      updatedAt: new Date(),
-    };
-    
-    this.sessions.set(sessionId, updatedSession);
-    
-    telemetryService.track('session_state_changed', {
-      sessionId,
-      previousState: session.status,
-      newState: targetState,
+  private emitTelemetry(event: string, session: GameSession, metadata?: Record<string, unknown>): void {
+    telemetryService.track(event, {
+      sessionId: session.id,
       playerId: session.playerId,
       gameType: session.gameType,
+      status: session.status,
+      score: session.score,
+      ...metadata,
     });
-    
-    return updatedSession;
   }
 
   createSession(input: CreateSessionInput): GameSession {
     this.validatePlayerId(input.playerId);
     this.validateGameType(input.gameType);
-    
+
     if (input.initialScore !== undefined) {
       this.validateScore(input.initialScore);
     }
@@ -168,136 +157,146 @@ export class GameSessionService {
       gameType: input.gameType,
       status: 'created',
       score: input.initialScore ?? 0,
-      metadata: {},
+      metadata: input.metadata ?? {},
       createdAt: now,
       updatedAt: now,
+      completedAt: undefined,
     };
 
     this.sessions.set(session.id, session);
-    this.addToPlayerIndex(input.playerId, session.id);
+    this.addToPlayerIndex(session.playerId, session.id);
 
-    telemetryService.track('session_created', {
-      sessionId: session.id,
-      playerId: session.playerId,
-      gameType: session.gameType,
-      initialScore: session.score,
-    });
+    this.emitTelemetry('session_created', session);
 
     return session;
   }
 
-  getSession(sessionId: string): GameSession {
-    return this.getSessionOrThrow(sessionId);
+  getSession(id: string): GameSession {
+    return this.getSessionOrThrow(id);
   }
 
-  updateSession(sessionId: string, updates: UpdateSessionInput): GameSession {
-    const session = this.getSessionOrThrow(sessionId);
-    
-    if (updates.status !== undefined) {
-      this.validateStateTransition(sessionId, session.status, updates.status);
+  updateSession(id: string, input: UpdateSessionInput): GameSession {
+    const session = this.getSessionOrThrow(id);
+
+    if (input.status !== undefined) {
+      this.validateStateTransition(id, session.status, input.status);
+      session.status = input.status;
+      
+      if (input.status === 'completed' || input.status === 'abandoned') {
+        session.completedAt = new Date();
+      }
     }
-    
-    if (updates.score !== undefined) {
-      this.validateScore(updates.score);
+
+    if (input.score !== undefined) {
+      this.validateScore(input.score);
+      session.score = input.score;
     }
 
-    const updatedSession: GameSession = {
-      ...session,
-      ...updates,
-      metadata: {
-        ...session.metadata,
-        ...updates.metadata,
-      },
-      updatedAt: new Date(),
-    };
+    if (input.metadata !== undefined) {
+      session.metadata = { ...session.metadata, ...input.metadata };
+    }
 
-    this.sessions.set(sessionId, updatedSession);
+    session.updatedAt = new Date();
+    this.sessions.set(id, session);
 
-    telemetryService.track('session_updated', {
-      sessionId,
-      playerId: session.playerId,
-      changes: Object.keys(updates),
-    });
+    this.emitTelemetry('session_updated', session, { changes: input });
 
-    return updatedSession;
+    return session;
   }
 
-  deleteSession(sessionId: string): void {
-    const session = this.getSessionOrThrow(sessionId);
+  completeSession(id: string, finalScore?: number): GameSession {
+    const session = this.getSessionOrThrow(id);
     
-    this.sessions.delete(sessionId);
-    this.removeFromPlayerIndex(session.playerId, sessionId);
+    this.validateStateTransition(id, session.status, 'completed');
+    
+    if (finalScore !== undefined) {
+      this.validateScore(finalScore);
+      session.score = finalScore;
+    }
 
-    telemetryService.track('session_deleted', {
-      sessionId,
-      playerId: session.playerId,
-      gameType: session.gameType,
-      status: session.status,
-    });
+    session.status = 'completed';
+    session.completedAt = new Date();
+    session.updatedAt = new Date();
+
+    this.sessions.set(id, session);
+
+    this.emitTelemetry('session_completed', session, { finalScore: session.score });
+
+    return session;
+  }
+
+  abandonSession(id: string): GameSession {
+    const session = this.getSessionOrThrow(id);
+    
+    this.validateStateTransition(id, session.status, 'abandoned');
+
+    session.status = 'abandoned';
+    session.completedAt = new Date();
+    session.updatedAt = new Date();
+
+    this.sessions.set(id, session);
+
+    this.emitTelemetry('session_abandoned', session);
+
+    return session;
   }
 
   listSessions(options: ListSessionsOptions = {}): GameSession[] {
-    let sessions = Array.from(this.sessions.values());
+    const { playerId, status, gameType, limit = 50, offset = 0 } = options;
 
-    if (options.playerId) {
-      sessions = sessions.filter(s => s.playerId === options.playerId);
+    let sessions: GameSession[];
+
+    if (playerId) {
+      const sessionIds = this.playerSessionsIndex.get(playerId);
+      if (!sessionIds) {
+        return [];
+      }
+      sessions = Array.from(sessionIds)
+        .map(id => this.sessions.get(id))
+        .filter((s): s is GameSession => s !== undefined);
+    } else {
+      sessions = Array.from(this.sessions.values());
     }
-    if (options.status) {
-      sessions = sessions.filter(s => s.status === options.status);
+
+    if (status) {
+      sessions = sessions.filter(s => s.status === status);
     }
-    if (options.gameType) {
-      sessions = sessions.filter(s => s.gameType === options.gameType);
+
+    if (gameType) {
+      sessions = sessions.filter(s => s.gameType === gameType);
     }
 
     sessions.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
 
-    const offset = options.offset ?? 0;
-    const limit = options.limit ?? 50;
-
     return sessions.slice(offset, offset + limit);
   }
 
-  startSession(sessionId: string): GameSession {
-    return this.transitionState(sessionId, 'active');
+  listPlayerSessions(playerId: string, options: Omit<ListSessionsOptions, 'playerId'> = {}): GameSession[] {
+    this.validatePlayerId(playerId);
+    return this.listSessions({ ...options, playerId });
   }
 
-  pauseSession(sessionId: string): GameSession {
-    return this.transitionState(sessionId, 'paused');
-  }
-
-  resumeSession(sessionId: string): GameSession {
-    return this.transitionState(sessionId, 'active');
-  }
-
-  completeSession(sessionId: string, score: number): GameSession {
-    this.validateScore(score);
+  deleteSession(id: string): void {
+    const session = this.getSessionOrThrow(id);
     
-    const session = this.getSessionOrThrow(sessionId);
-    this.validateStateTransition(sessionId, session.status, 'completed');
+    this.sessions.delete(id);
+    this.removeFromPlayerIndex(session.playerId, id);
 
-    const updatedSession: GameSession = {
-      ...session,
-      status: 'completed',
-      score,
-      completedAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    this.sessions.set(sessionId, updatedSession);
-
-    telemetryService.track('session_completed', {
-      sessionId,
-      playerId: session.playerId,
-      gameType: session.gameType,
-      finalScore: score,
-      durationMs: updatedSession.completedAt.getTime() - session.createdAt.getTime(),
-    });
-
-    return updatedSession;
+    this.emitTelemetry('session_deleted', session);
   }
 
-  abandonSession(sessionId: string): GameSession {
-    return this.transitionState(sessionId, 'abandoned');
+  getSessionCount(): number {
+    return this.sessions.size;
+  }
+
+  getPlayerSessionCount(playerId: string): number {
+    const sessionIds = this.playerSessionsIndex.get(playerId);
+    return sessionIds?.size ?? 0;
+  }
+
+  clear(): void {
+    this.sessions.clear();
+    this.playerSessionsIndex.clear();
   }
 }
 
