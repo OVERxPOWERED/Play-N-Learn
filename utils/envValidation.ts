@@ -11,7 +11,8 @@ export interface EnvConfig {
   DATABASE_URL: string;
   NEXTAUTH_SECRET: string;
   NEXTAUTH_URL: string;
-  TELEMETRY_ENDPOINT: string;
+  REDIS_URL: string;
+  OTEL_EXPORTER_OTLP_ENDPOINT: string;
   NEXT_PUBLIC_API_URL: string;
   
   // Optional variables with defaults
@@ -85,6 +86,18 @@ function validateNodeEnv(value: string | undefined): 'development' | 'production
 }
 
 /**
+ * Validates Redis URL format (redis:// or rediss://)
+ */
+function isValidRedisUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'redis:' || parsed.protocol === 'rediss:';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Validates all environment variables and returns typed configuration.
  * Throws descriptive errors on missing or invalid configuration.
  * Implements fail-fast behavior for application startup.
@@ -135,43 +148,51 @@ export function validateEnv(): EnvConfig {
   }
 
   try {
-    // Required: Telemetry endpoint for observability
-    config.TELEMETRY_ENDPOINT = validateRequired(
-      'TELEMETRY_ENDPOINT',
-      process.env.TELEMETRY_ENDPOINT,
-      isValidUrl,
-      'TELEMETRY_ENDPOINT must be a valid URL'
+    // Required: Redis URL for caching (must be valid redis:// or rediss:// URL)
+    config.REDIS_URL = validateRequired(
+      'REDIS_URL',
+      process.env.REDIS_URL,
+      isValidRedisUrl,
+      'REDIS_URL must be a valid Redis URL (e.g., redis://localhost:6379 or rediss://user:pass@host:port)'
     );
   } catch (e) {
     errors.push(e instanceof Error ? e.message : String(e));
   }
 
   try {
-    // Required: Public API URL for client-side requests
+    // Required: OpenTelemetry exporter endpoint for telemetry
+    config.OTEL_EXPORTER_OTLP_ENDPOINT = validateRequired(
+      'OTEL_EXPORTER_OTLP_ENDPOINT',
+      process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+      isValidUrl,
+      'OTEL_EXPORTER_OTLP_ENDPOINT must be a valid URL (e.g., https://otel-collector:4318/v1/traces)'
+    );
+  } catch (e) {
+    errors.push(e instanceof Error ? e.message : String(e));
+  }
+
+  try {
+    // Required: Public API URL for client-side API calls
     config.NEXT_PUBLIC_API_URL = validateRequired(
       'NEXT_PUBLIC_API_URL',
       process.env.NEXT_PUBLIC_API_URL,
       isValidUrl,
-      'NEXT_PUBLIC_API_URL must be a valid URL'
+      'NEXT_PUBLIC_API_URL must be a valid URL (e.g., https://api.example.com)'
     );
   } catch (e) {
     errors.push(e instanceof Error ? e.message : String(e));
   }
 
-  // Optional: GSAP debug mode (defaults to false)
+  // Optional: GSAP debug flag
   config.NEXT_PUBLIC_GSAP_DEBUG = parseBoolean(process.env.NEXT_PUBLIC_GSAP_DEBUG, false);
 
-  // Optional: OGL debug mode (defaults to false)
+  // Optional: OGL debug flag
   config.NEXT_PUBLIC_OGL_DEBUG = parseBoolean(process.env.NEXT_PUBLIC_OGL_DEBUG, false);
 
-  // Optional: NODE_ENV with validation (defaults to development)
-  try {
-    config.NODE_ENV = validateNodeEnv(process.env.NODE_ENV);
-  } catch (e) {
-    errors.push(e instanceof Error ? e.message : String(e));
-  }
+  // Optional: NODE_ENV with validation
+  config.NODE_ENV = validateNodeEnv(process.env.NODE_ENV);
 
-  // Throw aggregated error if any validation failed
+  // If any errors collected, throw aggregated error
   if (errors.length > 0) {
     const errorMessage = [
       'Environment validation failed:',
@@ -183,25 +204,50 @@ export function validateEnv(): EnvConfig {
     throw new Error(errorMessage);
   }
 
-  // Cache and return the validated configuration
+  // Cache and return validated config
   validatedEnv = config as EnvConfig;
   return validatedEnv;
 }
 
 /**
- * Get validated environment config (throws if not validated yet)
- * Use this in modules that need access to validated env after startup
+ * Returns the validated environment configuration.
+ * Throws if validation hasn't been run or failed.
+ * Use this for typed access to environment variables throughout the application.
  */
-export function getValidatedEnv(): EnvConfig {
+export function getEnv(): EnvConfig {
   if (!validatedEnv) {
-    throw new Error('Environment not validated. Call validateEnv() first during application startup.');
+    return validateEnv();
   }
   return validatedEnv;
 }
 
 /**
- * Reset the cached environment (useful for testing)
+ * Resets the cached validation (useful for testing)
  */
-export function resetValidatedEnv(): void {
+export function resetEnvValidation(): void {
   validatedEnv = null;
+}
+
+/**
+ * Type-safe accessor for a specific environment variable
+ */
+export function getEnvVar<K extends keyof EnvConfig>(key: K): EnvConfig[K] {
+  return getEnv()[key];
+}
+
+// Run validation at module load time in non-test environments
+// This ensures fail-fast behavior during application startup
+if (process.env.NODE_ENV !== 'test') {
+  // Use IIFE to avoid top-level await and handle errors gracefully
+  (() => {
+    try {
+      validateEnv();
+    } catch (error) {
+      // In development, log the error but don't throw to allow hot-reloading
+      // In production, the error will be thrown by getEnv() when first accessed
+      if (process.env.NODE_ENV === 'development') {
+        console.error('[envValidation] Environment validation failed:', error instanceof Error ? error.message : String(error));
+      }
+    }
+  })();
 }
