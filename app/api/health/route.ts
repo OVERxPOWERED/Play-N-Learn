@@ -155,93 +155,62 @@ class HealthCheckService {
         status: 'healthy',
         latencyMs: Date.now() - start,
         details: { 
-          nextAuthConfigured: true,
-          sessionAccessible: true,
-          hasSession: !!session,
+          sessionValid: !!session,
+          provider: 'next-auth',
         },
       };
     } catch (error) {
       return {
         name: 'auth',
-        status: 'unhealthy',
+        status: 'degraded',
         latencyMs: Date.now() - start,
-        error: error instanceof Error ? error.message : 'Auth service unavailable',
+        error: error instanceof Error ? error.message : 'Auth service check failed',
       };
     }
   }
 
   private async checkExternalAPIs(): Promise<HealthCheckResult> {
     const start = Date.now();
-    const apis = [
-      { name: 'storage', url: process.env.S3_ENDPOINT || process.env.BLOB_STORAGE_URL },
-      { name: 'realtime', url: process.env.PUSHER_URL || process.env.ABLY_URL },
-    ].filter(api => api.url);
+    const results: Record<string, { status: string; latencyMs: number }> = {};
+    let overallHealthy = true;
 
-    if (apis.length === 0) {
-      return {
-        name: 'external_apis',
-        status: 'degraded',
-        latencyMs: Date.now() - start,
-        details: { message: 'No external APIs configured' },
-      };
-    }
+    const apiChecks = [
+      { name: 'redis', url: process.env.REDIS_HEALTH_URL || 'http://localhost:6379/health' },
+      { name: 'email', url: process.env.EMAIL_SERVICE_HEALTH_URL },
+      { name: 'storage', url: process.env.STORAGE_SERVICE_HEALTH_URL },
+    ].filter(Boolean);
 
-    try {
-      const results = await Promise.allSettled(
-        apis.map(async (api) => {
-          const apiStart = Date.now();
-          try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 3000);
-            
-            const response = await fetch(`${api.url}/health`, {
-              method: 'GET',
-              signal: controller.signal,
-              headers: { 'User-Agent': 'HealthCheck/1.0' },
-            });
-            
-            clearTimeout(timeout);
-            
-            return {
-              name: api.name,
-              status: response.ok ? 'healthy' : 'degraded',
-              latencyMs: Date.now() - apiStart,
-              details: { status: response.status },
-            };
-          } catch (fetchError) {
-            return {
-              name: api.name,
-              status: 'unhealthy',
-              latencyMs: Date.now() - apiStart,
-              error: fetchError instanceof Error ? fetchError.message : 'API unreachable',
-            };
+    await Promise.all(
+      apiChecks.map(async (api) => {
+        const apiStart = Date.now();
+        try {
+          if (!api.url) {
+            results[api.name] = { status: 'skipped', latencyMs: 0 };
+            return;
           }
-        })
-      );
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 3000);
+          const response = await fetch(api.url!, { signal: controller.signal });
+          clearTimeout(timeout);
+          
+          const latency = Date.now() - apiStart;
+          const healthy = response.ok;
+          results[api.name] = { status: healthy ? 'healthy' : 'unhealthy', latencyMs: latency };
+          if (!healthy) overallHealthy = false;
+        } catch {
+          const latency = Date.now() - apiStart;
+          results[api.name] = { status: 'unhealthy', latencyMs: latency };
+          overallHealthy = false;
+        }
+      })
+    );
 
-      const failedCount = results.filter(r => r.status === 'fulfilled' && r.value.status === 'unhealthy').length;
-      const degradedCount = results.filter(r => r.status === 'fulfilled' && r.value.status === 'degraded').length;
-      
-      let overallStatus: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
-      if (failedCount > 0) overallStatus = 'unhealthy';
-      else if (degradedCount > 0) overallStatus = 'degraded';
-
-      return {
-        name: 'external_apis',
-        status: overallStatus,
-        latencyMs: Date.now() - start,
-        details: {
-          apis: results.map(r => r.status === 'fulfilled' ? r.value : { name: 'unknown', status: 'unhealthy', error: r.reason }),
-        },
-      };
-    } catch (error) {
-      return {
-        name: 'external_apis',
-        status: 'unhealthy',
-        latencyMs: Date.now() - start,
-        error: error instanceof Error ? error.message : 'External API check failed',
-      };
-    }
+    return {
+      name: 'external_apis',
+      status: overallHealthy ? 'healthy' : 'degraded',
+      latencyMs: Date.now() - start,
+      details: results,
+    };
   }
 
   private async checkMemoryUsage(): Promise<HealthCheckResult> {
@@ -250,10 +219,12 @@ class HealthCheckService {
       const usage = process.memoryUsage();
       const heapUsedMB = Math.round(usage.heapUsed / 1024 / 1024);
       const heapTotalMB = Math.round(usage.heapTotal / 1024 / 1024);
-      const heapUsagePercent = Math.round((usage.heapUsed / usage.heapTotal) * 100);
+      const externalMB = Math.round(usage.external / 1024 / 1024);
       const rssMB = Math.round(usage.rss / 1024 / 1024);
-
+      
+      const heapUsagePercent = (usage.heapUsed / usage.heapTotal) * 100;
       let status: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
+      
       if (heapUsagePercent > 90) status = 'unhealthy';
       else if (heapUsagePercent > 75) status = 'degraded';
 
@@ -264,9 +235,9 @@ class HealthCheckService {
         details: {
           heapUsedMB,
           heapTotalMB,
-          heapUsagePercent,
+          externalMB,
           rssMB,
-          externalMB: Math.round(usage.external / 1024 / 1024),
+          heapUsagePercent: Math.round(heapUsagePercent * 100) / 100,
         },
       };
     } catch (error) {
@@ -283,20 +254,22 @@ class HealthCheckService {
     const start = Date.now();
     try {
       const cpuUsage = process.cpuUsage();
-      const cpuPercent = (cpuUsage.user + cpuUsage.system) / 1000000;
+      const userCPU = cpuUsage.user / 1000;
+      const systemCPU = cpuUsage.system / 1000;
+      const totalCPU = userCPU + systemCPU;
       
       let status: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
-      if (cpuPercent > 80) status = 'unhealthy';
-      else if (cpuPercent > 60) status = 'degraded';
+      if (totalCPU > 80) status = 'unhealthy';
+      else if (totalCPU > 60) status = 'degraded';
 
       return {
         name: 'cpu',
         status,
         latencyMs: Date.now() - start,
         details: {
-          userMicroseconds: cpuUsage.user,
-          systemMicroseconds: cpuUsage.system,
-          totalPercent: Math.round(cpuPercent * 100) / 100,
+          userCPUTimeMs: Math.round(userCPU),
+          systemCPUTimeMs: Math.round(systemCPU),
+          totalCPUTimeMs: Math.round(totalCPU),
         },
       };
     } catch (error) {
@@ -312,33 +285,24 @@ class HealthCheckService {
   private async checkDiskSpace(): Promise<HealthCheckResult> {
     const start = Date.now();
     try {
-      const { statfs } = await import('fs/promises');
-      const stats = await statfs(process.cwd());
+      const fs = await import('fs');
+      const stats = fs.statSync(process.cwd());
       
-      const totalGB = (stats.blocks * stats.bsize) / 1024 / 1024 / 1024;
-      const freeGB = (stats.bfree * stats.bsize) / 1024 / 1024 / 1024;
-      const usedPercent = Math.round(((totalGB - freeGB) / totalGB) * 100);
-
-      let status: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
-      if (usedPercent > 90) status = 'unhealthy';
-      else if (usedPercent > 80) status = 'degraded';
-
       return {
         name: 'disk',
-        status,
+        status: 'healthy',
         latencyMs: Date.now() - start,
         details: {
-          totalGB: Math.round(totalGB * 100) / 100,
-          freeGB: Math.round(freeGB * 100) / 100,
-          usedPercent,
+          path: process.cwd(),
+          accessible: true,
         },
       };
     } catch (error) {
       return {
         name: 'disk',
-        status: 'degraded',
+        status: 'unhealthy',
         latencyMs: Date.now() - start,
-        details: { message: 'Disk check not available in this environment' },
+        error: error instanceof Error ? error.message : 'Disk space check failed',
       };
     }
   }
@@ -346,10 +310,9 @@ class HealthCheckService {
   private async checkSSEConnectionPool(): Promise<HealthCheckResult> {
     const start = Date.now();
     try {
-      const count = this.sseConnectionCount;
       const maxConnections = parseInt(process.env.MAX_SSE_CONNECTIONS || '1000', 10);
-      const usagePercent = Math.round((count / maxConnections) * 100);
-
+      const usagePercent = (this.sseConnectionCount / maxConnections) * 100;
+      
       let status: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
       if (usagePercent > 90) status = 'unhealthy';
       else if (usagePercent > 75) status = 'degraded';
@@ -359,9 +322,9 @@ class HealthCheckService {
         status,
         latencyMs: Date.now() - start,
         details: {
-          activeConnections: count,
+          activeConnections: this.sseConnectionCount,
           maxConnections,
-          usagePercent,
+          usagePercent: Math.round(usagePercent * 100) / 100,
         },
       };
     } catch (error) {
@@ -375,105 +338,62 @@ class HealthCheckService {
   }
 
   private evaluateOverallStatus(checks: HealthCheckResult[]): 'healthy' | 'degraded' | 'unhealthy' {
-    if (checks.some(c => c.status === 'unhealthy')) return 'unhealthy';
-    if (checks.some(c => c.status === 'degraded')) return 'degraded';
+    if (checks.length === 0) return 'healthy';
+    
+    const hasUnhealthy = checks.some((c) => c.status === 'unhealthy');
+    const hasDegraded = checks.some((c) => c.status === 'degraded');
+    
+    if (hasUnhealthy) return 'unhealthy';
+    if (hasDegraded) return 'degraded';
     return 'healthy';
   }
-
-  private async simulateAsyncOperation(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
 }
 
-const healthService = HealthCheckService.getInstance();
+const healthCheckService = HealthCheckService.getInstance();
+
+function verifyInternalAccess(request: NextRequest): boolean {
+  const secret = process.env.HEALTH_CHECK_SECRET;
+  if (!secret) return true;
+  
+  const providedSecret = request.headers.get('x-health-check-secret');
+  return providedSecret === secret;
+}
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
-  const { searchParams } = new URL(request.url);
-  const probe = searchParams.get('probe');
-
-  try {
-    let response: HealthResponse;
-    let statusCode = 200;
-
-    switch (probe) {
-      case 'ready':
-        response = await healthService.runReadinessCheck();
-        statusCode = response.status === 'unhealthy' ? 503 : 200;
-        break;
-      case 'live':
-        response = await healthService.runLivenessCheck();
-        statusCode = response.status === 'unhealthy' ? 503 : 200;
-        break;
-      default:
-        response = await healthService.runFullHealthCheck();
-        statusCode = response.status === 'unhealthy' ? 503 : response.status === 'degraded' ? 200 : 200;
-    }
-
-    return NextResponse.json(response, { 
-      status: statusCode,
-      headers: {
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'X-Health-Check': probe || 'full',
-      },
-    });
-  } catch (error) {
-    const errorResponse: HealthResponse = {
-      status: 'unhealthy',
-      checks: [{
-        name: 'health_check',
-        status: 'unhealthy',
-        latencyMs: 0,
-        error: error instanceof Error ? error.message : 'Health check failed',
-      }],
-      timestamp: new Date().toISOString(),
-      version: process.env.npm_package_version || '1.0.0',
-      uptimeMs: Date.now() - (healthService as any).startTime,
-    };
-
-    return NextResponse.json(errorResponse, { 
-      status: 503,
-      headers: {
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-      },
-    });
+  if (!verifyInternalAccess(request)) {
+    return NextResponse.json(
+      { error: 'Unauthorized' },
+      { status: 401 }
+    );
   }
-}
 
-export async function HEAD(request: NextRequest): Promise<NextResponse> {
   const { searchParams } = new URL(request.url);
-  const probe = searchParams.get('probe');
-
-  try {
-    let response: HealthResponse;
-
-    switch (probe) {
-      case 'ready':
-        response = await healthService.runReadinessCheck();
-        break;
-      case 'live':
-        response = await healthService.runLivenessCheck();
-        break;
-      default:
-        response = await healthService.runFullHealthCheck();
-    }
-
-    const statusCode = response.status === 'unhealthy' ? 503 : 200;
-    
-    return new NextResponse(null, { 
-      status: statusCode,
-      headers: {
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'X-Health-Check': probe || 'full',
-        'X-Health-Status': response.status,
-      },
-    });
-  } catch {
-    return new NextResponse(null, { 
-      status: 503,
-      headers: {
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'X-Health-Status': 'unhealthy',
-      },
-    });
+  const type = searchParams.get('type') || 'readiness';
+  
+  let response: HealthResponse;
+  
+  switch (type) {
+    case 'liveness':
+      response = await healthCheckService.runLivenessCheck();
+      break;
+    case 'readiness':
+      response = await healthCheckService.runReadinessCheck();
+      break;
+    case 'full':
+      response = await healthCheckService.runFullHealthCheck();
+      break;
+    default:
+      response = await healthCheckService.runReadinessCheck();
   }
+
+  const statusCode = response.status === 'healthy' ? 200 : response.status === 'degraded' ? 200 : 503;
+  
+  await telemetry.recordMetric('health_check', {
+    type,
+    status: response.status,
+    checkCount: response.checks.length,
+    unhealthyCount: response.checks.filter(c => c.status === 'unhealthy').length,
+  });
+
+  return NextResponse.json(response, { status: statusCode });
 }
