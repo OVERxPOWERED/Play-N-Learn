@@ -161,10 +161,31 @@ const setupTestDatabase = async () => {
 
 const teardownTestDatabase = async () => {
   try {
-    execSync(`dropdb ${testDbUrl.split('/').pop()}`, { stdio: 'ignore' });
-  } catch {
-    // Ignore cleanup errors
+    execSync(`dropdb ${testDbUrl.split('/').pop()}`, { 
+      stdio: 'ignore',
+      env: { ...process.env, DATABASE_URL: testDbUrl }
+    });
+  } catch (error) {
+    console.warn('Database cleanup failed');
   }
+};
+
+// Helper to create authenticated request
+const createAuthRequest = (token?: string) => {
+  const req = request(baseUrl);
+  if (token) {
+    req.set('Authorization', `Bearer ${token}`);
+  }
+  return req;
+};
+
+// Valid state transitions
+const VALID_TRANSITIONS: Record<string, string[]> = {
+  CREATED: ['ACTIVE', 'ABANDONED'],
+  ACTIVE: ['PAUSED', 'COMPLETED', 'ABANDONED'],
+  PAUSED: ['ACTIVE', 'ABANDONED'],
+  COMPLETED: [],
+  ABANDONED: [],
 };
 
 describe('Game Flow Integration Tests', () => {
@@ -180,339 +201,317 @@ describe('Game Flow Integration Tests', () => {
     await server.close();
     await app.close();
     await teardownTestDatabase();
-  }, 30000);
+    await mockPrisma.$disconnect();
+  });
 
   beforeEach(() => {
     vi.clearAllMocks();
     mockTelemetryEvents.length = 0;
-    
-    // Reset Prisma mocks with default implementations
-    mockPrisma.player.create.mockReset();
-    mockPrisma.player.findUnique.mockReset();
-    mockPrisma.player.findMany.mockReset();
-    mockPrisma.player.update.mockReset();
-    
-    mockPrisma.gameSession.create.mockReset();
-    mockPrisma.gameSession.findUnique.mockReset();
-    mockPrisma.gameSession.findMany.mockReset();
-    mockPrisma.gameSession.findFirst.mockReset();
-    mockPrisma.gameSession.update.mockReset();
-    mockPrisma.gameSession.updateMany.mockReset();
-    
-    mockPrisma.score.create.mockReset();
-    mockPrisma.score.findUnique.mockReset();
-    mockPrisma.score.findMany.mockReset();
-    mockPrisma.score.findFirst.mockReset();
-    mockPrisma.score.update.mockReset();
-    mockPrisma.score.aggregate.mockReset();
   });
 
   afterEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
   });
 
-  describe('Player Creation', () => {
-    it('should create a new player successfully', async () => {
-      const playerData = {
-        username: 'testplayer_' + Date.now(),
-        displayName: 'Test Player',
-        avatarUrl: 'https://example.com/avatar.png',
-      };
+  describe('POST /api/game-sessions', () => {
+    it('creates a new game session with valid payload', async () => {
+      const sessionId = randomUUID();
+      const playerId = randomUUID();
+      
+      mockPrisma.gameSession.create.mockResolvedValue({
+        id: sessionId,
+        playerId,
+        state: 'CREATED',
+        score: 0,
+        level: 1,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
 
-      const createdPlayer = {
-        id: randomUUID(),
-        ...playerData,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        stats: {
-          gamesPlayed: 0,
-          gamesWon: 0,
-          totalScore: 0,
-          highestScore: 0,
-        },
-      };
-
-      mockPrisma.player.create.mockResolvedValue(createdPlayer);
-
-      const response = await request(baseUrl)
-        .post('/api/players')
-        .send(playerData)
-        .expect('Content-Type', /json/)
+      const response = await createAuthRequest('valid-token')
+        .post('/api/game-sessions')
+        .send({ playerId, level: 1 })
         .expect(201);
 
       expect(response.body).toMatchObject({
-        id: expect.any(String),
-        username: playerData.username,
-        displayName: playerData.displayName,
-        avatarUrl: playerData.avatarUrl,
-        createdAt: expect.any(String),
-        updatedAt: expect.any(String),
-        stats: {
-          gamesPlayed: 0,
-          gamesWon: 0,
-          totalScore: 0,
-          highestScore: 0,
-        },
+        id: sessionId,
+        playerId,
+        state: 'CREATED',
+        score: 0,
+        level: 1,
       });
-
-      expect(mockPrisma.player.create).toHaveBeenCalledWith({
-        data: expect.objectContaining({
-          username: playerData.username,
-          displayName: playerData.displayName,
-          avatarUrl: playerData.avatarUrl,
-        }),
-      });
-
-      // Verify telemetry event emitted
-      const { emitTelemetry } = await import('@/lib/telemetry');
-      expect(emitTelemetry).toHaveBeenCalledWith('player_created', expect.objectContaining({
-        playerId: expect.any(String),
-        username: playerData.username,
-      }));
+      expect(response.body.createdAt).toBeDefined();
+      expect(mockPrisma.gameSession.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ playerId, level: 1 }),
+        })
+      );
     });
 
-    it('should reject duplicate username with 409', async () => {
-      const playerData = {
-        username: 'duplicate_user',
-        displayName: 'Test Player',
-      };
-
-      mockPrisma.player.create.mockRejectedValue({
-        code: 'P2002',
-        meta: { target: ['username'] },
-      });
-
-      const response = await request(baseUrl)
-        .post('/api/players')
-        .send(playerData)
-        .expect('Content-Type', /json/)
-        .expect(409);
-
-      expect(response.body).toMatchObject({
-        error: 'Username already exists',
-        code: 'DUPLICATE_USERNAME',
-      });
-    });
-
-    it('should validate required fields', async () => {
-      const response = await request(baseUrl)
-        .post('/api/players')
-        .send({ displayName: 'No Username' })
-        .expect('Content-Type', /json/)
+    it('rejects empty payload with 400', async () => {
+      const response = await createAuthRequest('valid-token')
+        .post('/api/game-sessions')
+        .send({})
         .expect(400);
 
-      expect(response.body).toMatchObject({
-        error: expect.stringContaining('username'),
-        code: 'VALIDATION_ERROR',
-      });
+      expect(response.body.error).toBe('Validation failed');
+      expect(response.body.details).toContainEqual(
+        expect.objectContaining({ field: 'playerId' })
+      );
+    });
+
+    it('rejects malformed UUID with 400', async () => {
+      const response = await createAuthRequest('valid-token')
+        .post('/api/game-sessions')
+        .send({ playerId: 'not-a-uuid', level: 1 })
+        .expect(400);
+
+      expect(response.body.error).toBe('Validation failed');
+      expect(response.body.details).toContainEqual(
+        expect.objectContaining({ field: 'playerId' })
+      );
+    });
+
+    it('returns 401 for unauthorized access', async () => {
+      const response = await request(baseUrl)
+        .post('/api/game-sessions')
+        .send({ playerId: randomUUID(), level: 1 })
+        .expect(401);
+
+      expect(response.body.error).toBe('Unauthorized');
+    });
+
+    it('returns 429 when rate limit exceeded', async () => {
+      // Simulate rate limiting by making many requests
+      const promises = Array(101).fill(null).map(() => 
+        createAuthRequest('valid-token')
+          .post('/api/game-sessions')
+          .send({ playerId: randomUUID(), level: 1 })
+      );
+
+      const responses = await Promise.all(promises);
+      const rateLimited = responses.some(r => r.status === 429);
+      expect(rateLimited).toBe(true);
     });
   });
 
-  describe('Complete Session Flow', () => {
-    let playerId: string;
-    let sessionId: string;
+  describe('GET /api/game-sessions', () => {
+    it('returns list of game sessions for player', async () => {
+      const playerId = randomUUID();
+      const sessions = [
+        { id: randomUUID(), playerId, state: 'COMPLETED', score: 100, level: 1, createdAt: new Date(), updatedAt: new Date() },
+        { id: randomUUID(), playerId, state: 'ACTIVE', score: 50, level: 2, createdAt: new Date(), updatedAt: new Date() },
+      ];
+
+      mockPrisma.gameSession.findMany.mockResolvedValue(sessions);
+
+      const response = await createAuthRequest('valid-token')
+        .get(`/api/game-sessions?playerId=${playerId}`)
+        .expect(200);
+
+      expect(response.body).toHaveLength(2);
+      expect(response.body[0]).toMatchObject(sessions[0]);
+      expect(mockPrisma.gameSession.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { playerId },
+          orderBy: { createdAt: 'desc' },
+        })
+      );
+    });
+
+    it('returns empty array when no sessions exist', async () => {
+      mockPrisma.gameSession.findMany.mockResolvedValue([]);
+
+      const response = await createAuthRequest('valid-token')
+        .get(`/api/game-sessions?playerId=${randomUUID()}`)
+        .expect(200);
+
+      expect(response.body).toEqual([]);
+    });
+
+    it('returns 400 when playerId is missing', async () => {
+      const response = await createAuthRequest('valid-token')
+        .get('/api/game-sessions')
+        .expect(400);
+
+      expect(response.body.error).toBe('Validation failed');
+    });
+
+    it('returns 401 for unauthorized access', async () => {
+      const response = await request(baseUrl)
+        .get(`/api/game-sessions?playerId=${randomUUID()}`)
+        .expect(401);
+
+      expect(response.body.error).toBe('Unauthorized');
+    });
+  });
+
+  describe('PATCH /api/game-sessions/:id', () => {
+    const sessionId = randomUUID();
+    const playerId = randomUUID();
 
     beforeEach(() => {
-      playerId = randomUUID();
-      sessionId = randomUUID();
-    });
-
-    it('should complete full game session lifecycle: create -> start -> progress -> complete', async () => {
-      // Step 1: Create player
-      const player = {
-        id: playerId,
-        username: 'flow_test_' + Date.now(),
-        displayName: 'Flow Test Player',
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        stats: { gamesPlayed: 0, gamesWon: 0, totalScore: 0, highestScore: 0 },
-      };
-      mockPrisma.player.findUnique.mockResolvedValue(player);
-
-      // Step 2: Create session
-      const newSession = {
+      mockPrisma.gameSession.findUnique.mockResolvedValue({
         id: sessionId,
         playerId,
-        status: 'CREATED',
-        level: 1,
+        state: 'CREATED',
         score: 0,
-        startedAt: null,
-        completedAt: null,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-      mockPrisma.gameSession.create.mockResolvedValue(newSession);
-
-      const createResponse = await request(baseUrl)
-        .post('/api/sessions')
-        .send({ playerId, level: 1 })
-        .expect('Content-Type', /json/)
-        .expect(201);
-
-      expect(createResponse.body).toMatchObject({
-        id: sessionId,
-        playerId,
-        status: 'CREATED',
         level: 1,
-        score: 0,
-      });
-
-      // Verify session_created telemetry
-      const { emitTelemetry, getTelemetryEvents } = await import('@/lib/telemetry');
-      expect(emitTelemetry).toHaveBeenCalledWith('session_created', expect.objectContaining({
-        sessionId,
-        playerId,
-        level: 1,
-      }));
-
-      // Step 3: Start session
-      const startedSession = { ...newSession, status: 'IN_PROGRESS', startedAt: new Date().toISOString() };
-      mockPrisma.gameSession.update.mockResolvedValue(startedSession);
-
-      const startResponse = await request(baseUrl)
-        .patch(`/api/sessions/${sessionId}/start`)
-        .expect('Content-Type', /json/)
-        .expect(200);
-
-      expect(startResponse.body).toMatchObject({
-        id: sessionId,
-        status: 'IN_PROGRESS',
-        startedAt: expect.any(String),
-      });
-
-      expect(emitTelemetry).toHaveBeenCalledWith('session_started', expect.objectContaining({
-        sessionId,
-        playerId,
-      }));
-
-      // Step 4: Progress session (multiple updates)
-      const progressData = { score: 1500, level: 2, moves: 25 };
-      const progressedSession = { ...startedSession, ...progressData, updatedAt: new Date().toISOString() };
-      mockPrisma.gameSession.update.mockResolvedValue(progressedSession);
-
-      const progressResponse = await request(baseUrl)
-        .patch(`/api/sessions/${sessionId}/progress`)
-        .send(progressData)
-        .expect('Content-Type', /json/)
-        .expect(200);
-
-      expect(progressResponse.body).toMatchObject({
-        id: sessionId,
-        score: 1500,
-        level: 2,
-      });
-
-      expect(emitTelemetry).toHaveBeenCalledWith('session_progress', expect.objectContaining({
-        sessionId,
-        playerId,
-        score: 1500,
-        level: 2,
-        moves: 25,
-      }));
-
-      // Step 5: Complete session
-      const completedSession = { 
-        ...progressedSession, 
-        status: 'COMPLETED', 
-        completedAt: new Date().toISOString(),
-        finalScore: 1500,
-      };
-      mockPrisma.gameSession.update.mockResolvedValue(completedSession);
-      mockPrisma.player.update.mockResolvedValue({
-        ...player,
-        stats: { gamesPlayed: 1, gamesWon: 1, totalScore: 1500, highestScore: 1500 },
-      });
-      mockPrisma.score.create.mockResolvedValue({
-        id: randomUUID(),
-        playerId,
-        sessionId,
-        value: 1500,
-        level: 2,
-        createdAt: new Date().toISOString(),
-      });
-
-      const completeResponse = await request(baseUrl)
-        .patch(`/api/sessions/${sessionId}/complete`)
-        .send({ finalScore: 1500 })
-        .expect('Content-Type', /json/)
-        .expect(200);
-
-      expect(completeResponse.body).toMatchObject({
-        id: sessionId,
-        status: 'COMPLETED',
-        finalScore: 1500,
-        completedAt: expect.any(String),
-      });
-
-      // Verify completion telemetry
-      expect(emitTelemetry).toHaveBeenCalledWith('session_completed', expect.objectContaining({
-        sessionId,
-        playerId,
-        finalScore: 1500,
-        duration: expect.any(Number),
-      }));
-
-      // Verify score persistence
-      expect(mockPrisma.score.create).toHaveBeenCalledWith({
-        data: expect.objectContaining({
-          playerId,
-          sessionId,
-          value: 1500,
-          level: 2,
-        }),
-      });
-
-      // Verify player stats updated
-      expect(mockPrisma.player.update).toHaveBeenCalledWith({
-        where: { id: playerId },
-        data: expect.objectContaining({
-          stats: expect.objectContaining({
-            gamesPlayed: 1,
-            gamesWon: 1,
-            totalScore: 1500,
-            highestScore: 1500,
-          }),
-        }),
+        createdAt: new Date(),
+        updatedAt: new Date(),
       });
     });
 
-    it('should handle session abandonment', async () => {
-      const abandonedSession = {
-        id: sessionId,
-        playerId,
-        status: 'IN_PROGRESS',
-        level: 1,
-        score: 500,
-        startedAt: new Date().toISOString(),
-        createdAt: new Date().toISOString(),
-      };
-      mockPrisma.gameSession.findUnique.mockResolvedValue(abandonedSession);
+    it('updates state with valid transition CREATED -> ACTIVE', async () => {
       mockPrisma.gameSession.update.mockResolvedValue({
-        ...abandonedSession,
-        status: 'ABANDONED',
-        completedAt: new Date().toISOString(),
+        id: sessionId,
+        playerId,
+        state: 'ACTIVE',
+        score: 0,
+        level: 1,
+        createdAt: new Date(),
+        updatedAt: new Date(),
       });
 
-      const response = await request(baseUrl)
-        .patch(`/api/sessions/${sessionId}/abandon`)
-        .expect('Content-Type', /json/)
+      const response = await createAuthRequest('valid-token')
+        .patch(`/api/game-sessions/${sessionId}`)
+        .send({ state: 'ACTIVE' })
         .expect(200);
 
-      expect(response.body).toMatchObject({
+      expect(response.body.state).toBe('ACTIVE');
+      expect(mockPrisma.gameSession.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: sessionId },
+          data: { state: 'ACTIVE' },
+        })
+      );
+    });
+
+    it('updates state with valid transition ACTIVE -> PAUSED', async () => {
+      mockPrisma.gameSession.findUnique.mockResolvedValue({
         id: sessionId,
-        status: 'ABANDONED',
+        playerId,
+        state: 'ACTIVE',
+        score: 100,
+        level: 1,
+        createdAt: new Date(),
+        updatedAt: new Date(),
       });
 
-      const { emitTelemetry } = await import('@/lib/telemetry');
-      expect(emitTelemetry).toHaveBeenCalledWith('session_abandoned', expect.objectContaining({
-        sessionId,
+      mockPrisma.gameSession.update.mockResolvedValue({
+        id: sessionId,
         playerId,
-        score: 500,
-      }));
-    });
-  });
+        state: 'PAUSED',
+        score: 100,
+        level: 1,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
 
-  describe('Concurrent Session Handling', () => {
-    it('should prevent multiple active sessions for same player', async () => {
-      const playerId = randomUUID();
-      const existingSessionId =
+      const response = await createAuthRequest('valid-token')
+        .patch(`/api/game-sessions/${sessionId}`)
+        .send({ state: 'PAUSED' })
+        .expect(200);
+
+      expect(response.body.state).toBe('PAUSED');
+    });
+
+    it('updates state with valid transition PAUSED -> ACTIVE', async () => {
+      mockPrisma.gameSession.findUnique.mockResolvedValue({
+        id: sessionId,
+        playerId,
+        state: 'PAUSED',
+        score: 100,
+        level: 1,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      mockPrisma.gameSession.update.mockResolvedValue({
+        id: sessionId,
+        playerId,
+        state: 'ACTIVE',
+        score: 100,
+        level: 1,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const response = await createAuthRequest('valid-token')
+        .patch(`/api/game-sessions/${sessionId}`)
+        .send({ state: 'ACTIVE' })
+        .expect(200);
+
+      expect(response.body.state).toBe('ACTIVE');
+    });
+
+    it('updates state with valid transition ACTIVE -> COMPLETED', async () => {
+      mockPrisma.gameSession.findUnique.mockResolvedValue({
+        id: sessionId,
+        playerId,
+        state: 'ACTIVE',
+        score: 500,
+        level: 3,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      mockPrisma.gameSession.update.mockResolvedValue({
+        id: sessionId,
+        playerId,
+        state: 'COMPLETED',
+        score: 500,
+        level: 3,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const response = await createAuthRequest('valid-token')
+        .patch(`/api/game-sessions/${sessionId}`)
+        .send({ state: 'COMPLETED', score: 500 })
+        .expect(200);
+
+      expect(response.body.state).toBe('COMPLETED');
+      expect(response.body.score).toBe(500);
+    });
+
+    it('updates state with valid transition ACTIVE -> ABANDONED', async () => {
+      mockPrisma.gameSession.findUnique.mockResolvedValue({
+        id: sessionId,
+        playerId,
+        state: 'ACTIVE',
+        score: 100,
+        level: 1,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      mockPrisma.gameSession.update.mockResolvedValue({
+        id: sessionId,
+        playerId,
+        state: 'ABANDONED',
+        score: 100,
+        level: 1,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const response = await createAuthRequest('valid-token')
+        .patch(`/api/game-sessions/${sessionId}`)
+        .send({ state: 'ABANDONED' })
+        .expect(200);
+
+      expect(response.body.state).toBe('ABANDONED');
+    });
+
+    it('rejects invalid transition CREATED -> COMPLETED with 400', async () => {
+      const response = await createAuthRequest('valid-token')
+        .patch(`/api/game-sessions/${sessionId}`)
+        .send({ state: 'COMPLETED' })
+        .expect(400);
+
+      expect(response.body.error).toBe('Invalid state transition');
+      expect(response.body.details).toContain('CREATED -> COMPLETED');
+    });
+
+    it('rejects invalid transition COMPLETED -> ACTIVE with 400', async () => {
