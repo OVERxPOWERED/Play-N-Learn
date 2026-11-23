@@ -65,10 +65,29 @@ export const CACHE_TTL = {
   LEADERBOARD: 5 * 60 * 1000,
 } as const;
 
+export const REACT_QUERY_CONFIG = {
+  staleTime: 30 * 1000,
+  gcTime: 5 * 60 * 1000,
+  retry: 2,
+  refetchOnWindowFocus: false,
+  refetchOnReconnect: true,
+} as const;
+
 interface CacheEntry<T> {
   data: T;
   timestamp: number;
   stale: boolean;
+}
+
+type QueryFunction<T> = () => Promise<T>;
+
+interface ReactQueryOptions<T> {
+  queryKey: QueryKey;
+  queryFn: QueryFunction<T>;
+  staleTime?: number;
+  gcTime?: number;
+  retry?: number;
+  enabled?: boolean;
 }
 
 class QueryCacheService {
@@ -150,293 +169,198 @@ class QueryCacheService {
       .filter(([, value]) => value !== undefined)
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([key, value]) => `${key}:${value}`)
-      .join('|');
+      .join(',');
     return `${this.KEY_PREFIX}sessions:list:${filterString || 'all'}`;
   }
 
-  async get<T>(key: string): Promise<T | null> {
-    await this.connect();
-    const startTime = Date.now();
-    
+  async getGameSession(sessionId: string): Promise<GameSession | null> {
+    const key = this.getSessionKey(sessionId);
+    const cached = this.memoryCache.get(key);
+    if (cached && !cached.stale) {
+      return cached.data as GameSession;
+    }
+
     try {
       const data = await this.redis.get(key);
-      const latency = Date.now() - startTime;
-      
       if (data) {
-        telemetryService.emit('cache.hit', { key, latency });
-        return JSON.parse(data) as T;
+        const session = JSON.parse(data) as GameSession;
+        this.memoryCache.set(key, { data: session, timestamp: Date.now(), stale: false });
+        return session;
       }
-      
-      telemetryService.emit('cache.miss', { key, latency });
-      return null;
     } catch (error) {
-      telemetryService.emit('cache.error', { 
-        key, 
-        operation: 'get', 
-        error: error instanceof Error ? error.message : 'Unknown error' 
-      });
-      return null;
+      telemetryService.emit('cache.get.error', { key, error: (error as Error).message });
     }
-  }
-
-  async set<T>(key: string, value: T, ttlSeconds: number): Promise<boolean> {
-    await this.connect();
-    const startTime = Date.now();
-    
-    try {
-      const serialized = JSON.stringify(value);
-      await this.redis.setex(key, ttlSeconds, serialized);
-      const latency = Date.now() - startTime;
-      
-      telemetryService.emit('cache.set', { key, ttl: ttlSeconds, latency });
-      return true;
-    } catch (error) {
-      telemetryService.emit('cache.error', { 
-        key, 
-        operation: 'set', 
-        error: error instanceof Error ? error.message : 'Unknown error' 
-      });
-      return false;
-    }
-  }
-
-  async delete(key: string): Promise<boolean> {
-    await this.connect();
-    const startTime = Date.now();
-    
-    try {
-      const result = await this.redis.del(key);
-      const latency = Date.now() - startTime;
-      
-      telemetryService.emit('cache.delete', { key, deleted: result > 0, latency });
-      return result > 0;
-    } catch (error) {
-      telemetryService.emit('cache.error', { 
-        key, 
-        operation: 'delete', 
-        error: error instanceof Error ? error.message : 'Unknown error' 
-      });
-      return false;
-    }
-  }
-
-  async deleteByPattern(pattern: string): Promise<number> {
-    await this.connect();
-    const startTime = Date.now();
-    
-    try {
-      let cursor = '0';
-      let totalDeleted = 0;
-      
-      do {
-        const [newCursor, keys] = await this.redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
-        cursor = newCursor;
-        
-        if (keys.length > 0) {
-          const deleted = await this.redis.del(...keys);
-          totalDeleted += deleted;
-        }
-      } while (cursor !== '0');
-      
-      const latency = Date.now() - startTime;
-      telemetryService.emit('cache.deletePattern', { pattern, deleted: totalDeleted, latency });
-      return totalDeleted;
-    } catch (error) {
-      telemetryService.emit('cache.error', { 
-        pattern, 
-        operation: 'deleteByPattern', 
-        error: error instanceof Error ? error.message : 'Unknown error' 
-      });
-      return 0;
-    }
-  }
-
-  getQueryCache<T>(queryKey: QueryKey): T | undefined {
-    const key = this.serializeKey(queryKey);
-    const entry = this.memoryCache.get(key) as CacheEntry<T> | undefined;
-    
-    if (!entry) return undefined;
-    
-    const ttl = this.getTTLForKey(key);
-    if (Date.now() - entry.timestamp > ttl) {
-      this.memoryCache.delete(key);
-      return undefined;
-    }
-    
-    return entry.data;
-  }
-
-  setQueryCache<T>(queryKey: QueryKey, data: T): void {
-    const key = this.serializeKey(queryKey);
-    this.memoryCache.set(key, {
-      data,
-      timestamp: Date.now(),
-      stale: false,
-    });
-  }
-
-  invalidateQueryCache(queryKey: QueryKey): void {
-    const key = this.serializeKey(queryKey);
-    this.memoryCache.delete(key);
-  }
-
-  invalidateQueryCacheByPrefix(prefix: QueryKey): void {
-    const prefixKey = this.serializeKey(prefix);
-    for (const key of this.memoryCache.keys()) {
-      if (key.startsWith(prefixKey.slice(0, -1))) {
-        this.memoryCache.delete(key);
-      }
-    }
-  }
-
-  async prefetchGameSessions(playerId: string): Promise<GameSession[]> {
-    const queryKey = CACHE_KEYS.GAME_SESSIONS(playerId);
-    const cached = this.getQueryCache<GameSession[]>(queryKey);
-    
-    if (cached) {
-      return cached;
-    }
-
-    const redisKey = this.getPlayerSessionsKey(playerId);
-    const data = await this.get<GameSession[]>(redisKey);
-    
-    if (data) {
-      this.setQueryCache(queryKey, data);
-      return data;
-    }
-
-    return [];
-  }
-
-  async invalidateGameSessions(playerId: string): Promise<void> {
-    const queryKey = CACHE_KEYS.GAME_SESSIONS(playerId);
-    this.invalidateQueryCache(queryKey);
-    
-    const redisKey = this.getPlayerSessionsKey(playerId);
-    await this.delete(redisKey);
-    
-    await this.deleteByPattern(`${this.KEY_PREFIX}sessions:list:*`);
-  }
-
-  async getCachedGameSession(sessionId: string): Promise<GameSession | null> {
-    const queryKey = CACHE_KEYS.GAME_SESSION(sessionId);
-    const cached = this.getQueryCache<GameSession>(queryKey);
-    
-    if (cached) {
-      return cached;
-    }
-
-    const redisKey = this.getSessionKey(sessionId);
-    const data = await this.get<GameSession>(redisKey);
-    
-    if (data) {
-      this.setQueryCache(queryKey, data);
-      return data;
-    }
-
     return null;
   }
 
-  async setGameSession(session: GameSession): Promise<boolean> {
-    const queryKey = CACHE_KEYS.GAME_SESSION(session.id);
-    this.setQueryCache(queryKey, session);
-    
-    const redisKey = this.getSessionKey(session.id);
-    const ttlSeconds = Math.floor(CACHE_TTL.GAME_SESSION / 1000);
-    return this.set(redisKey, session, ttlSeconds);
+  async setGameSession(session: GameSession): Promise<void> {
+    const key = this.getSessionKey(session.id);
+    const ttl = CACHE_TTL.GAME_SESSION;
+    try {
+      await this.redis.setex(key, Math.floor(ttl / 1000), JSON.stringify(session));
+      this.memoryCache.set(key, { data: session, timestamp: Date.now(), stale: false });
+      await this.invalidatePlayerSessions(session.playerId);
+    } catch (error) {
+      telemetryService.emit('cache.set.error', { key, error: (error as Error).message });
+    }
+  }
+
+  async getPlayerSessions(playerId: string, filters: SessionFilters = {}): Promise<GameSession[]> {
+    const key = this.getPlayerSessionsKey(playerId);
+    const cached = this.memoryCache.get(key);
+    if (cached && !cached.stale) {
+      return cached.data as GameSession[];
+    }
+
+    try {
+      const data = await this.redis.get(key);
+      if (data) {
+        const sessions = JSON.parse(data) as GameSession[];
+        this.memoryCache.set(key, { data: sessions, timestamp: Date.now(), stale: false });
+        return sessions;
+      }
+    } catch (error) {
+      telemetryService.emit('cache.get.error', { key, error: (error as Error).message });
+    }
+    return [];
+  }
+
+  async setPlayerSessions(playerId: string, sessions: GameSession[]): Promise<void> {
+    const key = this.getPlayerSessionsKey(playerId);
+    const ttl = CACHE_TTL.GAME_SESSIONS;
+    try {
+      await this.redis.setex(key, Math.floor(ttl / 1000), JSON.stringify(sessions));
+      this.memoryCache.set(key, { data: sessions, timestamp: Date.now(), stale: false });
+    } catch (error) {
+      telemetryService.emit('cache.set.error', { key, error: (error as Error).message });
+    }
+  }
+
+  async invalidatePlayerSessions(playerId: string): Promise<void> {
+    const key = this.getPlayerSessionsKey(playerId);
+    const entry = this.memoryCache.get(key);
+    if (entry) {
+      this.memoryCache.set(key, { ...entry, stale: true });
+    }
+    try {
+      await this.redis.del(key);
+    } catch (error) {
+      telemetryService.emit('cache.invalidate.error', { key, error: (error as Error).message });
+    }
+  }
+
+  async invalidateGameSession(sessionId: string): Promise<void> {
+    const key = this.getSessionKey(sessionId);
+    const entry = this.memoryCache.get(key);
+    if (entry) {
+      this.memoryCache.set(key, { ...entry, stale: true });
+    }
+    try {
+      await this.redis.del(key);
+    } catch (error) {
+      telemetryService.emit('cache.invalidate.error', { key, error: (error as Error).message });
+    }
   }
 
   async getPlayerStats(playerId: string): Promise<PlayerStats | null> {
-    const queryKey = CACHE_KEYS.PLAYER_STATS(playerId);
-    const cached = this.getQueryCache<PlayerStats>(queryKey);
-    
-    if (cached) {
-      return cached;
+    const key = `${this.KEY_PREFIX}stats:${playerId}`;
+    const cached = this.memoryCache.get(key);
+    if (cached && !cached.stale) {
+      return cached.data as PlayerStats;
     }
 
-    const redisKey = `${this.KEY_PREFIX}stats:player:${playerId}`;
-    const data = await this.get<PlayerStats>(redisKey);
-    
-    if (data) {
-      this.setQueryCache(queryKey, data);
-      return data;
+    try {
+      const data = await this.redis.get(key);
+      if (data) {
+        const stats = JSON.parse(data) as PlayerStats;
+        this.memoryCache.set(key, { data: stats, timestamp: Date.now(), stale: false });
+        return stats;
+      }
+    } catch (error) {
+      telemetryService.emit('cache.get.error', { key, error: (error as Error).message });
     }
-
     return null;
   }
 
-  async setPlayerStats(stats: PlayerStats): Promise<boolean> {
-    const queryKey = CACHE_KEYS.PLAYER_STATS(stats.playerId);
-    this.setQueryCache(queryKey, stats);
-    
-    const redisKey = `${this.KEY_PREFIX}stats:player:${stats.playerId}`;
-    const ttlSeconds = Math.floor(CACHE_TTL.PLAYER_STATS / 1000);
-    return this.set(redisKey, stats, ttlSeconds);
-  }
-
-  async invalidatePlayerStats(playerId: string): Promise<void> {
-    const queryKey = CACHE_KEYS.PLAYER_STATS(playerId);
-    this.invalidateQueryCache(queryKey);
-    
-    const redisKey = `${this.KEY_PREFIX}stats:player:${playerId}`;
-    await this.delete(redisKey);
+  async setPlayerStats(stats: PlayerStats): Promise<void> {
+    const key = `${this.KEY_PREFIX}stats:${stats.playerId}`;
+    const ttl = CACHE_TTL.PLAYER_STATS;
+    try {
+      await this.redis.setex(key, Math.floor(ttl / 1000), JSON.stringify(stats));
+      this.memoryCache.set(key, { data: stats, timestamp: Date.now(), stale: false });
+    } catch (error) {
+      telemetryService.emit('cache.set.error', { key, error: (error as Error).message });
+    }
   }
 
   async getLeaderboard(limit: number = 100): Promise<LeaderboardEntry[]> {
-    const queryKey = CACHE_KEYS.LEADERBOARD(limit);
-    const cached = this.getQueryCache<LeaderboardEntry[]>(queryKey);
-    
-    if (cached) {
-      return cached;
+    const key = `${this.KEY_PREFIX}leaderboard:${limit}`;
+    const cached = this.memoryCache.get(key);
+    if (cached && !cached.stale) {
+      return cached.data as LeaderboardEntry[];
     }
 
-    const redisKey = `${this.KEY_PREFIX}leaderboard:${limit}`;
-    const data = await this.get<LeaderboardEntry[]>(redisKey);
-    
-    if (data) {
-      this.setQueryCache(queryKey, data);
-      return data;
+    try {
+      const data = await this.redis.get(key);
+      if (data) {
+        const leaderboard = JSON.parse(data) as LeaderboardEntry[];
+        this.memoryCache.set(key, { data: leaderboard, timestamp: Date.now(), stale: false });
+        return leaderboard;
+      }
+    } catch (error) {
+      telemetryService.emit('cache.get.error', { key, error: (error as Error).message });
     }
-
     return [];
   }
 
-  async setLeaderboard(entries: LeaderboardEntry[], limit: number = 100): Promise<boolean> {
-    const queryKey = CACHE_KEYS.LEADERBOARD(limit);
-    this.setQueryCache(queryKey, entries);
-    
-    const redisKey = `${this.KEY_PREFIX}leaderboard:${limit}`;
-    const ttlSeconds = Math.floor(CACHE_TTL.LEADERBOARD / 1000);
-    return this.set(redisKey, entries, ttlSeconds);
-  }
-
-  async invalidateLeaderboard(): Promise<void> {
-    this.invalidateQueryCacheByPrefix(['leaderboard']);
-    await this.deleteByPattern(`${this.KEY_PREFIX}leaderboard:*`);
-  }
-
-  async healthCheck(): Promise<{ status: 'healthy' | 'degraded' | 'down'; latency: number }> {
-    const startTime = Date.now();
-    
+  async setLeaderboard(entries: LeaderboardEntry[], limit: number = 100): Promise<void> {
+    const key = `${this.KEY_PREFIX}leaderboard:${limit}`;
+    const ttl = CACHE_TTL.LEADERBOARD;
     try {
-      await this.connect();
-      await this.redis.ping();
-      const latency = Date.now() - startTime;
-      
-      return { 
-        status: latency < 100 ? 'healthy' : 'degraded', 
-        latency 
-      };
-    } catch {
-      return { status: 'down', latency: Date.now() - startTime };
+      await this.redis.setex(key, Math.floor(ttl / 1000), JSON.stringify(entries));
+      this.memoryCache.set(key, { data: entries, timestamp: Date.now(), stale: false });
+    } catch (error) {
+      telemetryService.emit('cache.set.error', { key, error: (error as Error).message });
     }
   }
 
-  async disconnect(): Promise<void> {
-    await this.redis.quit();
+  async invalidateAll(): Promise<void> {
     this.memoryCache.clear();
+    try {
+      const keys = await this.redis.keys(`${this.KEY_PREFIX}*`);
+      if (keys.length > 0) {
+        await this.redis.del(...keys);
+      }
+    } catch (error) {
+      telemetryService.emit('cache.invalidateAll.error', { error: (error as Error).message });
+    }
   }
-}
 
-export const queryCacheService = QueryCacheService.getInstance();
-export default queryCacheService;
+  getMemoryCacheStats(): { size: number; keys: string[] } {
+    return {
+      size: this.memoryCache.size,
+      keys: Array.from(this.memoryCache.keys()),
+    };
+  }
+
+  createQueryOptions<T>(queryKey: QueryKey, queryFn: QueryFunction<T>, options: Partial<ReactQueryOptions<T>> = {}): ReactQueryOptions<T> {
+    return {
+      queryKey,
+      queryFn,
+      staleTime: REACT_QUERY_CONFIG.staleTime,
+      gcTime: REACT_QUERY_CONFIG.gcTime,
+      retry: REACT_QUERY_CONFIG.retry,
+      ...options,
+    };
+  }
+
+  createGameSessionsQueryOptions(playerId?: string, filters: SessionFilters = {}): ReactQueryOptions<GameSession[]> {
+    return this.createQueryOptions<GameSession[]>(
+      CACHE_KEYS.GAME_SESSIONS(playerId),
+      async () => {
+        const response = await fetch('/api/game-sessions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ playerId, ...filters }),
+        });
+        if (!response.ok) throw new Error
