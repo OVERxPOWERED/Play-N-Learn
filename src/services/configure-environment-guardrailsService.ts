@@ -11,6 +11,8 @@ interface EnvSchemaShape {
   NEXTAUTH_URL: string;
   OPENAI_API_KEY: string;
   NODE_ENV: 'development' | 'production' | 'test';
+  NEXT_PUBLIC_API_URL: string;
+  OGL_RENDER_MODE: 'webgl' | 'webgl2' | 'auto';
   // Optional variables with defaults
   LOG_LEVEL?: 'debug' | 'info' | 'warn' | 'error';
   RATE_LIMIT_MAX?: string;
@@ -18,6 +20,14 @@ interface EnvSchemaShape {
 }
 
 type ValidatedEnv = Required<EnvSchemaShape>;
+
+interface FeatureFlags {
+  enableProfiling: boolean;
+  enableTelemetry: boolean;
+  enableCaching: boolean;
+  enableExperimentalFeatures: boolean;
+  enableDebugPanel: boolean;
+}
 
 class EnvironmentValidationError extends Error {
   public readonly missingVars: string[];
@@ -64,12 +74,26 @@ function validatePositiveInteger(value: string): boolean {
   return !isNaN(num) && num > 0 && Number.isInteger(num);
 }
 
+function validateOglRenderMode(value: string): value is 'webgl' | 'webgl2' | 'auto' {
+  return ['webgl', 'webgl2', 'auto'].includes(value);
+}
+
+function validateOpenAIKey(value: string): boolean {
+  return validateNonEmptyString(value, 'OPENAI_API_KEY') && (value.startsWith('sk-') || value.startsWith('sk-proj-'));
+}
+
+function validateNextAuthSecret(value: string): boolean {
+  return validateNonEmptyString(value, 'NEXTAUTH_SECRET') && value.length >= 32;
+}
+
 const validators: Record<keyof EnvSchemaShape, (value: string) => boolean> = {
   DATABASE_URL: (v) => validateNonEmptyString(v, 'DATABASE_URL') && validateUrl(v, 'DATABASE_URL'),
-  NEXTAUTH_SECRET: (v) => validateNonEmptyString(v, 'NEXTAUTH_SECRET') && v.length >= 32,
+  NEXTAUTH_SECRET: validateNextAuthSecret,
   NEXTAUTH_URL: (v) => validateNonEmptyString(v, 'NEXTAUTH_URL') && validateUrl(v, 'NEXTAUTH_URL'),
-  OPENAI_API_KEY: (v) => validateNonEmptyString(v, 'OPENAI_API_KEY') && v.startsWith('sk-'),
+  OPENAI_API_KEY: validateOpenAIKey,
   NODE_ENV: validateNodeEnv,
+  NEXT_PUBLIC_API_URL: (v) => validateNonEmptyString(v, 'NEXT_PUBLIC_API_URL') && validateUrl(v, 'NEXT_PUBLIC_API_URL'),
+  OGL_RENDER_MODE: validateOglRenderMode,
   LOG_LEVEL: validateLogLevel,
   RATE_LIMIT_MAX: validatePositiveInteger,
   RATE_LIMIT_WINDOW_MS: validatePositiveInteger,
@@ -81,6 +105,8 @@ const requiredVars: (keyof EnvSchemaShape)[] = [
   'NEXTAUTH_URL',
   'OPENAI_API_KEY',
   'NODE_ENV',
+  'NEXT_PUBLIC_API_URL',
+  'OGL_RENDER_MODE',
 ];
 
 const optionalVarsWithDefaults: Partial<Record<keyof EnvSchemaShape, string>> = {
@@ -91,6 +117,7 @@ const optionalVarsWithDefaults: Partial<Record<keyof EnvSchemaShape, string>> = 
 
 let validatedConfig: ValidatedEnv | null = null;
 let validationPromise: Promise<ValidatedEnv> | null = null;
+let featureFlags: FeatureFlags | null = null;
 
 function performValidation(): ValidatedEnv {
   const missingVars: string[] = [];
@@ -116,7 +143,7 @@ function performValidation(): ValidatedEnv {
     if (value === undefined || value === '') {
       result[key] = defaultValue as ValidatedEnv[typeof key];
     } else if (!validators[key](value)) {
-      invalidVars.push(key);
+      invalidVars.push(varName);
     } else {
       result[key] = value as ValidatedEnv[typeof key];
     }
@@ -129,122 +156,141 @@ function performValidation(): ValidatedEnv {
   return result as ValidatedEnv;
 }
 
+function initializeFeatureFlags(env: ValidatedEnv): FeatureFlags {
+  const isDevelopment = env.NODE_ENV === 'development';
+  const isProduction = env.NODE_ENV === 'production';
+  
+  return {
+    enableProfiling: isDevelopment || process.env.ENABLE_PROFILING === 'true',
+    enableTelemetry: isProduction && process.env.ENABLE_TELEMETRY !== 'false',
+    enableCaching: process.env.ENABLE_CACHING !== 'false',
+    enableExperimentalFeatures: isDevelopment && process.env.ENABLE_EXPERIMENTAL === 'true',
+    enableDebugPanel: isDevelopment && process.env.ENABLE_DEBUG_PANEL !== 'false',
+  };
+}
+
+/**
+ * Validates all environment variables at runtime.
+ * Throws EnvironmentValidationError if validation fails.
+ * Call this early in your application startup (e.g., in a custom _app.tsx or middleware).
+ */
 export function validateEnvironment(): ValidatedEnv {
   if (validatedConfig) {
     return validatedConfig;
   }
 
-  validatedConfig = performValidation();
-  return validatedConfig;
-}
-
-export async function validateEnvironmentAsync(): Promise<ValidatedEnv> {
-  if (validatedConfig) {
-    return validatedConfig;
-  }
-
   if (validationPromise) {
-    return validationPromise;
+    // If validation is already in progress, wait for it
+    return validationPromise.then((config) => config);
   }
 
   validationPromise = Promise.resolve().then(() => {
     validatedConfig = performValidation();
+    featureFlags = initializeFeatureFlags(validatedConfig);
     return validatedConfig;
   });
 
   return validationPromise;
 }
 
-export function getConfig(): ValidatedEnv {
+/**
+ * Gets the validated environment configuration.
+ * Must call validateEnvironment() first, or this will throw.
+ */
+export function getValidatedEnv(): ValidatedEnv {
   if (!validatedConfig) {
-    validateEnvironment();
+    throw new Error('Environment not validated. Call validateEnvironment() first.');
   }
-  return validatedConfig!;
+  return validatedConfig;
 }
 
-export function isEnvironmentValidated(): boolean {
-  return validatedConfig !== null;
+/**
+ * Gets a specific feature flag value.
+ * Initializes feature flags if not already done.
+ */
+export function getFeatureFlag<K extends keyof FeatureFlags>(flag: K): FeatureFlags[K] {
+  if (!featureFlags) {
+    if (!validatedConfig) {
+      validateEnvironment();
+    }
+    if (validatedConfig && !featureFlags) {
+      featureFlags = initializeFeatureFlags(validatedConfig);
+    }
+  }
+  
+  if (!featureFlags) {
+    throw new Error('Feature flags not initialized');
+  }
+  
+  return featureFlags[flag];
 }
 
-export function resetValidationCache(): void {
+/**
+ * Gets all feature flags as a read-only object.
+ */
+export function getAllFeatureFlags(): Readonly<FeatureFlags> {
+  if (!featureFlags) {
+    if (!validatedConfig) {
+      validateEnvironment();
+    }
+    if (validatedConfig && !featureFlags) {
+      featureFlags = initializeFeatureFlags(validatedConfig);
+    }
+  }
+  
+  if (!featureFlags) {
+    throw new Error('Feature flags not initialized');
+  }
+  
+  return Object.freeze({ ...featureFlags });
+}
+
+/**
+ * Checks if a feature is enabled (shorthand for getFeatureFlag).
+ */
+export function isFeatureEnabled(flag: keyof FeatureFlags): boolean {
+  return getFeatureFlag(flag) === true;
+}
+
+/**
+ * Resets the validation state (useful for testing).
+ * @internal
+ */
+export function _resetValidationState(): void {
   validatedConfig = null;
   validationPromise = null;
+  featureFlags = null;
+}
+
+/**
+ * Type-safe access to environment variables with validation.
+ * Use this instead of process.env directly in application code.
+ */
+export function getEnv<K extends keyof ValidatedEnv>(key: K): ValidatedEnv[K] {
+  const env = getValidatedEnv();
+  return env[key];
+}
+
+/**
+ * Checks if we're running in development mode.
+ */
+export function isDevelopment(): boolean {
+  return getValidatedEnv().NODE_ENV === 'development';
+}
+
+/**
+ * Checks if we're running in production mode.
+ */
+export function isProduction(): boolean {
+  return getValidatedEnv().NODE_ENV === 'production';
+}
+
+/**
+ * Checks if we're running in test mode.
+ */
+export function isTest(): boolean {
+  return getValidatedEnv().NODE_ENV === 'test';
 }
 
 export { EnvironmentValidationError };
-
-export interface ConfigureEnvironmentGuardrailsResult {
-  status: string;
-  milestone: string;
-  processedAt: string;
-  data?: Record<string, unknown>;
-}
-
-export class ConfigureEnvironmentGuardrailsService {
-  private initialized: boolean;
-
-  constructor() {
-    this.initialized = true;
-  }
-
-  public execute(params: Record<string, unknown> = {}): ConfigureEnvironmentGuardrailsResult {
-    if (!this.initialized) {
-      throw new Error('ConfigureEnvironmentGuardrailsService is not ready');
-    }
-
-    let validationStatus = 'valid';
-    let validationError: string | undefined;
-
-    try {
-      const config = getConfig();
-      return {
-        status: 'completed',
-        milestone: 'Milestone 1: Architecture & Foundation',
-        processedAt: new Date().toISOString(),
-        data: {
-          ...params,
-          validationStatus,
-          configKeys: Object.keys(config),
-          nodeEnv: config.NODE_ENV,
-        },
-      };
-    } catch (error) {
-      validationStatus = 'invalid';
-      validationError = error instanceof Error ? error.message : 'Unknown validation error';
-      return {
-        status: 'failed',
-        milestone: 'Milestone 1: Architecture & Foundation',
-        processedAt: new Date().toISOString(),
-        data: {
-          ...params,
-          validationStatus,
-          validationError,
-        },
-      };
-    }
-  }
-
-  public validateNow(): ValidatedEnv {
-    return validateEnvironment();
-  }
-
-  public getConfig(): ValidatedEnv {
-    return getConfig();
-  }
-
-  public isValidated(): boolean {
-    return isEnvironmentValidated();
-  }
-}
-
-export const defaultConfigureEnvironmentGuardrails = new ConfigureEnvironmentGuardrailsService();
-
-// Re-export for utils/envValidation.ts compatibility
-export const envValidation = {
-  validate: validateEnvironment,
-  validateAsync: validateEnvironmentAsync,
-  getConfig,
-  isValidated: isEnvironmentValidated,
-  reset: resetValidationCache,
-  EnvironmentValidationError,
-};
+export type { ValidatedEnv, FeatureFlags, EnvSchemaShape };
